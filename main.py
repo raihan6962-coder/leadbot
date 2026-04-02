@@ -1,4 +1,4 @@
-import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse, random
+import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse, random, logging
 import requests
 import concurrent.futures
 import urllib3
@@ -12,34 +12,78 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
 
-# Suppress SSL warnings for cleaner logs and slightly faster requests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-# ==========================================
-# ⚙️ CONFIGURATION
-# ==========================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# ════════════════════════════════════════════════════
+#   LOGGING SETUP
+# ════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s — %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("LeadGenPro")
 
-def get_headers():
-    HEADERS_LIST = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36",
-    ]
-    return {
-        "User-Agent": random.choice(HEADERS_LIST),
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+
+# ════════════════════════════════════════════════════
+#   [STOP FEATURE] GLOBAL STOP FLAG
+#   is_running is a dict keyed by job_id so multiple
+#   jobs can be individually stopped without collision.
+# ════════════════════════════════════════════════════
+job_stop_flags: dict = {}   # job_id -> threading.Event
+
+def _should_stop(job_id: str) -> bool:
+    flag = job_stop_flags.get(job_id)
+    return flag is not None and flag.is_set()
+
+# ════════════════════════════════════════════════════
+#   ROTATING HEADERS  — multiple realistic profiles
+# ════════════════════════════════════════════════════
+HEADERS_POOL = [
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Referer": "https://www.google.com/",
+        "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept-Language": "en-GB,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Referer": "https://www.google.com/",
-    }
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Referer": "https://www.google.com/",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    },
+]
 
-# ══════════════════════════════════════════════
-#   [NEW] GOOGLE SHEETS ASYNC DATABASE WRAPPER
-# ══════════════════════════════════════════════
+def get_headers():
+    return random.choice(HEADERS_POOL).copy()
+
+
+# ════════════════════════════════════════════════════
+#   GOOGLE SHEETS DB WRAPPER
+# ════════════════════════════════════════════════════
 class GoogleSheetsDB:
-    """Handles all database operations asynchronously so it doesn't slow down the scraper."""
     def __init__(self, webhook_url):
         self.url = webhook_url
 
@@ -47,167 +91,931 @@ class GoogleSheetsDB:
         try:
             requests.post(self.url, json=payload, timeout=15)
         except Exception as e:
-            pass # Fail silently in background to prevent crashing
+            logger.debug(f"[DB] Post failed silently: {e}")
 
     def send_action(self, action, data):
-        if not self.url: return
+        if not self.url:
+            return
         payload = {"action": action, "data": data}
-        # Fire and forget thread
         threading.Thread(target=self._post_async, args=(payload,), daemon=True).start()
 
     def log(self, action, details):
         self.send_action("log", {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "action": action,
-            "details": details
+            "details": str(details),
         })
 
-# ══════════════════════════════════════════════
-#   1. SUPER FAST PURE PYTHON SCRAPER
-# ══════════════════════════════════════════════
-class GoogleMapsScraper:
-    def fetch_batch(self, keyword, location):
-        query = urllib.parse.quote_plus(f"{keyword} in {location}")
-        all_leads = []
-        
-        def get_offset(start):
-            url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}&num=20&hl=en"
+
+# ════════════════════════════════════════════════════
+#   DEDUPLICATION STORE
+#   [PROBLEM 5] Strict deduplication: email OR website OR name+location
+# ════════════════════════════════════════════════════
+class DeduplicationStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._websites: set = set()
+        self._emails:   set = set()
+        self._name_locs: set = set()
+        self._total_skipped = 0
+
+    def _norm(self, val: str) -> str:
+        if not val or val == "N/A":
+            return ""
+        return re.sub(r'\s+', ' ', val.strip().lower())
+
+    def _norm_url(self, url: str) -> str:
+        if not url or url == "N/A":
+            return ""
+        try:
+            parsed = urllib.parse.urlparse(url.lower().strip())
+            host = parsed.netloc.replace("www.", "")
+            return host + parsed.path.rstrip("/")
+        except:
+            return url.lower().strip()
+
+    def is_duplicate(self, name: str, location: str, website: str, email: str) -> bool:
+        nn = self._norm(name)
+        nl = self._norm(location)
+        nloc = f"{nn} {nl}"
+        nw = self._norm_url(website)
+        ne = self._norm(email)
+
+        with self._lock:
+            if ne and ne in self._emails:   return True
+            if nw and nw in self._websites: return True
+            if nn and nl and nloc in self._name_locs: return True
+        return False
+
+    def register(self, name: str, location: str, website: str, email: str):
+        nn = self._norm(name)
+        nl = self._norm(location)
+        nloc = f"{nn} {nl}"
+        nw = self._norm_url(website)
+        ne = self._norm(email)
+
+        with self._lock:
+            if nn and nl: self._name_locs.add(nloc)
+            if nw: self._websites.add(nw)
+            if ne: self._emails.add(ne)
+
+    def mark_skipped(self):
+        with self._lock:
+            self._total_skipped += 1
+
+    @property
+    def skipped(self):
+        with self._lock:
+            return self._total_skipped
+
+
+# ════════════════════════════════════════════════════
+#   ADVANCED KEYWORD ENGINE
+#   [PROBLEM 2] generate_single_keyword generates EXACTLY ONE keyword
+#   at a time — never a bulk batch. The main loop calls this only when
+#   the pending queue is empty so we always process one kw fully first.
+# ════════════════════════════════════════════════════
+class AdvancedKeywordEngine:
+    COMMERCIAL_PREFIXES = [
+        "best", "top", "affordable", "cheap", "local", "professional",
+        "experienced", "certified", "trusted", "rated", "licensed",
+        "expert", "reliable", "fast", "emergency", "24 hour", "same day",
+        "family", "luxury", "premium", "budget", "high quality",
+    ]
+    COMMERCIAL_SUFFIXES = [
+        "services", "company", "agency", "near me", "in my area",
+        "specialist", "experts", "professionals", "contractor", "provider",
+        "consultant", "firm", "studio", "clinic", "center", "shop",
+        "office", "team", "solutions", "group",
+    ]
+    INTENT_MODIFIERS = [
+        "hire", "find", "looking for", "need",
+        "best rated", "top rated", "highly reviewed", "award winning",
+        "recommended", "free quote", "free estimate", "low cost",
+        "pricing", "reviews", "bad reviews", "poor service",
+        "negative reviews", "problems with",
+    ]
+    NICHE_MODIFIERS = {
+        "restaurant": ["takeout", "delivery", "dine in", "catering", "buffet"],
+        "dentist":    ["dental clinic", "teeth whitening", "orthodontist", "braces", "dental implants"],
+        "lawyer":     ["attorney", "law firm", "legal services", "counsel", "litigation"],
+        "plumber":    ["plumbing", "pipe repair", "drain cleaning", "water heater", "leak fix"],
+        "realtor":    ["real estate agent", "property dealer", "home buyer", "home seller", "property management"],
+        "gym":        ["fitness center", "workout", "personal trainer", "crossfit", "yoga studio"],
+        "salon":      ["hair salon", "beauty salon", "spa", "barber shop", "nail salon"],
+        "doctor":     ["physician", "medical clinic", "urgent care", "specialist", "general practitioner"],
+    }
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    def google_autosuggest(self, keyword, location):
+        results = set()
+        base_terms = [keyword, f"{keyword} {location}", f"best {keyword}", f"{keyword} services"]
+        for term in base_terms:
             try:
-                res = requests.get(url, headers=get_headers(), timeout=10)
-                soup = BeautifulSoup(res.text, 'html.parser')
-                blocks = soup.select('div.VkpGBb, div.rllt__details, div.uMdZh, div.cXedhc')
-                batch = []
-                
-                for block in blocks:
-                    text_content = block.get_text(separator=' ', strip=True)
-                    
-                    name_el = block.select_one('div[role="heading"], .dbg0pd, span.OSrXXb')
-                    name = name_el.get_text(strip=True) if name_el else "N/A"
-                    if name == "N/A" or len(name) < 3: continue
-                    
-                    rating_match = re.search(r'(\d[\.,]\d)\s*[\(\d]', text_content)
-                    rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
-                    
-                    ph = re.search(r'(\+?\d{1,3}[\s\-\(\)]?\d{3,4}[\s\-\(\)]?\d{3,4}[\s\-\(\)]?\d{3,4})', text_content)
-                    phone = ph.group(0).strip() if ph else "N/A"
-                    
+                url = f"https://suggestqueries.google.com/complete/search?client=firefox&q={urllib.parse.quote_plus(term)}"
+                r = self.session.get(url, headers=get_headers(), timeout=6)
+                data = r.json()
+                if isinstance(data, list) and len(data) > 1:
+                    for suggestion in data[1]:
+                        results.add(suggestion.strip())
+            except Exception as e:
+                logger.debug(f"[KEYWORDS] Autosuggest failed for '{term}': {e}")
+            time.sleep(0.3)
+        logger.info(f"[KEYWORDS] Autosuggest → {len(results)} suggestions for '{keyword}'")
+        return list(results)
+
+    def expand_with_variations(self, base_kw):
+        results = set()
+        for prefix in self.COMMERCIAL_PREFIXES:
+            results.add(f"{prefix} {base_kw}")
+        for suffix in self.COMMERCIAL_SUFFIXES:
+            results.add(f"{base_kw} {suffix}")
+        for modifier in self.INTENT_MODIFIERS:
+            results.add(f"{modifier} {base_kw}")
+        base_lower = base_kw.lower()
+        for niche_key, mods in self.NICHE_MODIFIERS.items():
+            if niche_key in base_lower:
+                for mod in mods:
+                    results.add(mod)
+                    for prefix in self.COMMERCIAL_PREFIXES[:5]:
+                        results.add(f"{prefix} {mod}")
+        logger.info(f"[KEYWORDS] Expansion → {len(results)} variants for '{base_kw}'")
+        return list(results)
+
+    def ai_generate(self, base_kw, location, used_kws):
+        fallback = self.expand_with_variations(base_kw)
+        if not GROQ_API_KEY:
+            return fallback
+        try:
+            client = Groq(api_key=GROQ_API_KEY)
+            prompt = (
+                f'You are a local SEO expert. Seed keyword: "{base_kw}". Location: "{location}". '
+                f'Already used: {list(used_kws)[:20]}. '
+                f'Generate 120 unique search terms a customer would type into Google. '
+                f'Include service variations, problem-based terms, niche subcategories, local intent, '
+                f'review-seeking terms. Return ONLY a comma-separated list. No numbering, no explanation.'
+            )
+            res = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama3-8b-8192",
+                temperature=0.8,
+                max_tokens=2000,
+            )
+            text = res.choices[0].message.content
+            ai_kws = [k.strip().strip('"').strip("'") for k in text.split(',')
+                      if k.strip() and k.strip().lower() not in used_kws]
+            combined = list(set(ai_kws + fallback))
+            logger.info(f"[KEYWORDS] AI → {len(combined)} keywords total")
+            return combined
+        except Exception as e:
+            logger.warning(f"[KEYWORDS] AI generation failed: {e} — using fallback")
+            return fallback
+
+    def generate_full_pool(self, base_kw, location, used_kws):
+        all_kws = set()
+        all_kws.update(self.ai_generate(base_kw, location, used_kws))
+        all_kws.update(self.google_autosuggest(base_kw, location))
+        all_kws.update(self.expand_with_variations(base_kw))
+        final = [k for k in all_kws if k.lower() not in used_kws and len(k) > 3]
+        if len(final) < 100:
+            for p in self.COMMERCIAL_PREFIXES:
+                final.append(f"{p} {base_kw}")
+        final = list(set(final))
+        logger.info(f"[KEYWORDS] Full pool → {len(final)} unique keywords for '{base_kw}'")
+        return final
+
+    # [PROBLEM 2] STRICT ONE-BY-ONE KEYWORD GENERATION
+    # Returns exactly ONE new keyword string (or None if exhausted).
+    # The main loop MUST NOT call this until the previous keyword's
+    # leads are fully processed.
+    def generate_single_keyword(self, base_kw, location, used_kws) -> str:
+        if GROQ_API_KEY:
+            try:
+                client = Groq(api_key=GROQ_API_KEY)
+                prompt = (
+                    f"You are a local SEO expert. Base keyword: '{base_kw}'. Location: '{location}'. "
+                    f"Used keywords: {list(used_kws)[:50]}. "
+                    f"Generate EXACTLY ONE new, highly relevant search term a user would type to find these local businesses. "
+                    f"Return ONLY the exact search term string. No quotes, no intro, no numbering."
+                )
+                res = client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama3-8b-8192",
+                    temperature=0.8,
+                    max_tokens=30,
+                )
+                text = res.choices[0].message.content.strip().strip('"').strip("'")
+                kw = text.split('\n')[0].split(',')[0].strip()
+                if kw and kw.lower() not in used_kws and len(kw) > 3:
+                    logger.info(f"[KEYWORDS] AI generated single keyword: '{kw}'")
+                    return kw
+            except Exception as e:
+                logger.warning(f"[KEYWORDS] AI single gen failed: {e}")
+
+        # [BUG FIX] Use distinct variable names in fallback loops to avoid shadowing
+        for p in self.COMMERCIAL_PREFIXES:
+            candidate = f"{p} {base_kw}"
+            if candidate.lower() not in used_kws:
+                return candidate
+        for s in self.COMMERCIAL_SUFFIXES:
+            candidate = f"{base_kw} {s}"
+            if candidate.lower() not in used_kws:
+                return candidate
+
+        return None
+
+
+# ════════════════════════════════════════════════════
+#   GOOGLE MAPS SCRAPER
+#   [PROBLEM 1] Three-step aggressive website extraction:
+#     Step 1 — extract from Maps listing HTML (JSON blob mining)
+#     Step 2 — fetch business details page, parse external URL from JSON data
+#     Step 3 — Google/DDG search fallback
+#   All steps validate that the URL is not a Google/aggregator domain.
+# ════════════════════════════════════════════════════
+class GoogleMapsScraper:
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2
+
+    # [PROBLEM 1] Blacklist to validate extracted website URLs
+    DOMAIN_BLACKLIST = [
+        'google.com', 'google.co', 'googleapis.com', 'gstatic.com',
+        'yelp.com', 'tripadvisor.com', 'facebook.com',
+        'instagram.com', 'twitter.com', 'linkedin.com', 'youtube.com', 'bbb.org',
+        'yellowpages.com', 'mapquest.com', 'foursquare.com', 'yahoo.com', 'bing.com',
+        'zoominfo.com', 'chamberofcommerce.com', 'houzz.com', 'angi.com', 'thumbtack.com',
+        'homeadvisor.com', 'angieslist.com', 'manta.com', 'superpages.com',
+        '/url?q=',
+    ]
+
+    def is_valid_website(self, url: str) -> bool:
+        """Return True only if url is a real external business website."""
+        if not url or url == "N/A":
+            return False
+        lower_url = url.lower()
+        for b in self.DOMAIN_BLACKLIST:
+            if b in lower_url:
+                return False
+        if not lower_url.startswith('http'):
+            return False
+        # Must have at least one dot in the domain after stripping protocol
+        try:
+            host = urllib.parse.urlparse(lower_url).netloc
+            if '.' not in host:
+                return False
+        except:
+            return False
+        return True
+
+    # [PROBLEM 1] Step 2: Mine Maps detail page for the external website link.
+    # Google Maps embeds business data in a large JSON blob inside the page HTML.
+    # We look for the "website" pattern in that JSON rather than parsing rendered DOM.
+    def fetch_website_from_details(self, maps_url: str) -> str:
+        if not maps_url or maps_url == "N/A":
+            return "N/A"
+        try:
+            resp = requests.get(maps_url, headers=get_headers(), timeout=12, verify=False)
+            html = resp.text
+
+            # Pattern 1: look for explicit "website" key in embedded JSON data
+            # Maps pages embed data as: ,"https://example.com",  near a "website" label
+            patterns = [
+                r'"website"\s*:\s*"(https?://[^"]+)"',
+                r'\"url\"\s*:\s*\"(https?://[^\"]+)\"',
+                # Pattern 2: look for URLs in the raw script blobs that aren't Google's own
+                r'\\x22(https?://(?!(?:www\.)?google)[^\\]+)\\x22',
+            ]
+            for pat in patterns:
+                matches = re.findall(pat, html)
+                for m in matches:
+                    clean = m.replace('\\u0026', '&').replace('\\/', '/')
+                    if self.is_valid_website(clean):
+                        logger.info(f"[WEBSITE-DETAILS] Found via Maps detail JSON: {clean}")
+                        return clean
+
+            # Pattern 3: scan all quoted URLs in the raw response
+            all_urls = re.findall(r'"(https?://[^"]{4,200})"', html)
+            for u in all_urls:
+                u_clean = u.replace('\\u0026', '&').replace('\\/', '/')
+                if self.is_valid_website(u_clean):
+                    logger.info(f"[WEBSITE-DETAILS] Found via raw URL scan: {u_clean}")
+                    return u_clean
+
+        except Exception as e:
+            logger.debug(f"[WEBSITE-DETAILS] Error fetching {maps_url}: {e}")
+        return "N/A"
+
+    def _scrape_google_maps(self, keyword: str, location: str) -> list:
+        results = []
+        query = urllib.parse.quote_plus(f"{keyword} {location}")
+        url = f"https://www.google.com/maps/search/{query}/"
+
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                logger.info(f"[SCRAPE-MAPS] Attempt {attempt}: {url}")
+                session = requests.Session()
+                session.headers.update(get_headers())
+
+                resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
+                logger.info(f"[SCRAPE-MAPS] HTTP {resp.status_code} | content-length={len(resp.text)}")
+
+                if resp.status_code != 200:
+                    time.sleep(self.RETRY_DELAY * attempt)
+                    continue
+
+                html = resp.text
+                businesses = self._parse_maps_html(html, keyword, location)
+
+                if businesses:
+                    logger.info(f"[SCRAPE-MAPS] Parsed {len(businesses)} businesses from Maps HTML")
+                    return businesses
+
+                businesses = self._parse_maps_html_elements(html, keyword, location)
+                if businesses:
+                    logger.info(f"[SCRAPE-MAPS] Parsed {len(businesses)} businesses from Maps HTML elements")
+                    return businesses
+
+                logger.warning(f"[SCRAPE-MAPS] Attempt {attempt}: zero results parsed, retrying...")
+                time.sleep(self.RETRY_DELAY * attempt)
+
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"[SCRAPE-MAPS] Request error attempt={attempt}: {e}")
+                time.sleep(self.RETRY_DELAY * attempt)
+            except Exception as e:
+                logger.error(f"[SCRAPE-MAPS] Unexpected error: {e}")
+                break
+
+        return results
+
+    def _parse_maps_html(self, html: str, keyword: str, location: str) -> list:
+        results = []
+        seen_names = set()
+
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            for script in soup.find_all('script', type='application/ld+json'):
+                try:
+                    data = json.loads(script.string or '')
+                    items = data if isinstance(data, list) else [data]
+                    for item in items:
+                        if item.get('@type') in ('LocalBusiness', 'Restaurant', 'Store',
+                                                  'MedicalBusiness', 'LegalService', 'HomeAndConstructionBusiness',
+                                                  'HealthAndBeautyBusiness', 'FoodEstablishment'):
+                            name = item.get('name', 'N/A')
+                            if not name or name in seen_names:
+                                continue
+                            seen_names.add(name)
+                            results.append({
+                                "Name":        name,
+                                "Phone":       item.get('telephone', 'N/A') or 'N/A',
+                                "Website":     item.get('url', 'N/A') or 'N/A',
+                                "Rating":      str(item.get('aggregateRating', {}).get('ratingValue', 'N/A')),
+                                "ReviewCount": str(item.get('aggregateRating', {}).get('reviewCount', '0')),
+                                "Address":     location,
+                                "Category":    keyword,
+                                # [PROBLEM 4] Always store Maps URL
+                                "Maps_Link":   item.get('hasMap', 'N/A') or f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}/",
+                            })
+                except:
+                    pass
+        except Exception as e:
+            logger.debug(f"[PARSE] JSON-LD parse error: {e}")
+
+        if results:
+            return results
+
+        try:
+            name_pattern = re.findall(
+                r'"([A-Z][^"]{2,60})"[^"]*?"([1-5]\.[0-9])"',
+                html
+            )
+            for name, rating in name_pattern[:50]:
+                name = name.strip()
+                if (len(name) < 3 or name in seen_names or
+                        any(c in name for c in ['\\', '/', '{', '}', '(', ')', '='])):
+                    continue
+                seen_names.add(name)
+                results.append({
+                    "Name":        name,
+                    "Phone":       "N/A",
+                    "Website":     "N/A",
+                    "Rating":      rating,
+                    "ReviewCount": "0",
+                    "Address":     location,
+                    "Category":    keyword,
+                    "Maps_Link":   f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}/",
+                })
+        except Exception as e:
+            logger.debug(f"[PARSE] Regex parse error: {e}")
+
+        return results
+
+    def _parse_maps_html_elements(self, html: str, keyword: str, location: str) -> list:
+        results = []
+        seen_names = set()
+        soup = BeautifulSoup(html, 'html.parser')
+
+        ITEM_SELECTORS = [
+            'div[role="article"]',
+            'div[aria-label][role="region"]',
+            'a[aria-label][href*="maps"]',
+            'div.Nv2PK',
+            'div.bfdHYd',
+            'div[jsaction*="mouseover"]',
+        ]
+
+        blocks = []
+        for sel in ITEM_SELECTORS:
+            found = soup.select(sel)
+            if found:
+                blocks = found
+                logger.info(f"[PARSE-ELEMENTS] Using selector '{sel}' → {len(found)} blocks")
+                break
+
+        for block in blocks[:30]:
+            try:
+                text = block.get_text(separator=' ', strip=True)
+
+                name = "N/A"
+                aria = block.get('aria-label', '')
+                if aria and len(aria) > 2 and len(aria) < 100:
+                    name = aria.strip()
+                if name == "N/A":
+                    h = block.select_one('[role="heading"], h3, h2, .fontHeadlineSmall')
+                    if h:
+                        name = h.get_text(strip=True)
+
+                if name == "N/A" or len(name) < 3 or name in seen_names:
+                    continue
+                seen_names.add(name)
+
+                rating = "N/A"
+                rm = re.search(r'\b([1-5][.,]\d)\b', text)
+                if rm:
+                    rv = rm.group(1).replace(',', '.')
+                    try:
+                        if 1.0 <= float(rv) <= 5.0:
+                            rating = rv
+                    except:
+                        pass
+
+                review_count = "0"
+                rc = re.search(r'\((\d{1,6})\)', text)
+                if rc:
+                    review_count = rc.group(1)
+
+                phone = "N/A"
+                ph = re.search(r'(\+?1?\s*\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})', text)
+                if ph:
+                    phone = ph.group(0).strip()
+
+                website = "N/A"
+                for a in block.select('a[href]'):
+                    href = a.get('href', '')
+                    if '/url?q=' in href:
+                        clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
+                        if self.is_valid_website(clean):
+                            website = clean
+                            break
+                    elif href.startswith('http') and self.is_valid_website(href):
+                        website = href
+                        break
+
+                results.append({
+                    "Name":        name,
+                    "Phone":       phone,
+                    "Website":     website,
+                    "Rating":      rating,
+                    "ReviewCount": review_count,
+                    "Address":     location,
+                    "Category":    keyword,
+                    # [PROBLEM 4] Construct Maps URL from name+location
+                    "Maps_Link":   f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}/",
+                })
+            except Exception as e:
+                logger.debug(f"[PARSE-ELEMENTS] Block error: {e}")
+
+        return results
+
+    def _scrape_google_local(self, keyword: str, location: str) -> list:
+        query = urllib.parse.quote_plus(f"{keyword} {location}")
+        all_results = []
+
+        def fetch_one_offset(start: int) -> list:
+            url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}&num=20&hl=en&gl=us"
+            for attempt in range(1, self.MAX_RETRIES + 1):
+                try:
+                    resp = requests.get(url, headers=get_headers(), timeout=12, verify=False)
+                    logger.info(f"[SCRAPE-LCL] offset={start} HTTP {resp.status_code}")
+                    if resp.status_code != 200:
+                        time.sleep(self.RETRY_DELAY * attempt)
+                        continue
+
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+
+                    blocks = soup.select(
+                        'div.VkpGBb, div.rllt__details, div.uMdZh, div.cXedhc, '
+                        'div.lqhpac, div[data-cid], div.rl_tit, li.rllt__list-item, '
+                        'div[class*="rllt"]'
+                    )
+
+                    logger.info(f"[SCRAPE-LCL] offset={start} → {len(blocks)} blocks found")
+
+                    batch = []
+                    for block in blocks:
+                        text = block.get_text(separator=' ', strip=True)
+
+                        name_el = block.select_one(
+                            'div[role="heading"], .dbg0pd, span.OSrXXb, '
+                            '.rllt__details div:first-child, [class*="tit"], '
+                            'div.rllt__details > div:first-child'
+                        )
+                        name = name_el.get_text(strip=True) if name_el else "N/A"
+                        if name == "N/A" or len(name) < 3:
+                            for el in block.children:
+                                txt = el.get_text(strip=True) if hasattr(el, 'get_text') else ''
+                                if len(txt) > 3 and len(txt) < 80:
+                                    name = txt
+                                    break
+                        if name == "N/A" or len(name) < 3:
+                            continue
+
+                        rating = "N/A"
+                        rm = re.search(r'\b([1-5][.,]\d)\b', text)
+                        if rm:
+                            rv = rm.group(1).replace(',', '.')
+                            try:
+                                if 1.0 <= float(rv) <= 5.0:
+                                    rating = rv
+                            except:
+                                pass
+
+                        review_count = "0"
+                        rc = re.search(r'\((\d{1,6})\)', text)
+                        if rc:
+                            review_count = rc.group(1)
+
+                        phone = "N/A"
+                        ph = re.search(r'(\+?1?\s*\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})', text)
+                        if ph:
+                            phone = ph.group(0).strip()
+
+                        website = "N/A"
+                        for a in block.select('a[href]'):
+                            href = a.get('href', '')
+                            if '/url?q=' in href:
+                                clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
+                                if self.is_valid_website(clean):
+                                    website = clean
+                                    break
+                            elif href.startswith('http') and self.is_valid_website(href):
+                                website = href
+                                break
+
+                        batch.append({
+                            "Name":        name,
+                            "Phone":       phone,
+                            "Website":     website,
+                            "Rating":      rating,
+                            "ReviewCount": review_count,
+                            "Address":     location,
+                            "Category":    keyword,
+                            # [PROBLEM 4] Maps URL stored for every lead
+                            "Maps_Link":   f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}/",
+                        })
+
+                    logger.info(f"[SCRAPE-LCL] offset={start} → {len(batch)} businesses parsed")
+                    return batch
+
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"[SCRAPE-LCL] Request error offset={start} attempt={attempt}: {e}")
+                    time.sleep(self.RETRY_DELAY * attempt)
+                except Exception as e:
+                    logger.error(f"[SCRAPE-LCL] Unexpected error offset={start}: {e}")
+                    break
+            return []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            futures = {ex.submit(fetch_one_offset, s): s for s in [0, 20, 40]}
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    all_results.extend(f.result())
+                except Exception as e:
+                    logger.error(f"[SCRAPE-LCL] Thread error: {e}")
+
+        return all_results
+
+    def _scrape_duckduckgo(self, keyword: str, location: str) -> list:
+        results = []
+        seen = set()
+        query = urllib.parse.quote_plus(f"{keyword} {location}")
+        url = f"https://html.duckduckgo.com/html/?q={query}"
+
+        try:
+            resp = requests.get(url, headers=get_headers(), timeout=12, verify=False)
+            logger.info(f"[SCRAPE-DDG] HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                return results
+
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            result_items = soup.select('.result, .results_links, div.result__body')
+
+            logger.info(f"[SCRAPE-DDG] {len(result_items)} result blocks found")
+
+            for item in result_items[:20]:
+                try:
+                    title_el = item.select_one('.result__title, a.result__a, h2')
+                    if not title_el:
+                        continue
+                    name = title_el.get_text(strip=True)
+                    if len(name) < 3 or name in seen:
+                        continue
+                    seen.add(name)
+
                     website = "N/A"
-                    for a in block.select('a[href]'):
-                        href = a['href']
-                        if '/url?q=' in href:
-                            clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
-                            if 'google' not in clean.lower() and clean.startswith('http'):
-                                website = clean; break
-                        elif href.startswith('http') and 'google' not in href.lower():
-                            website = href; break
-                            
-                    batch.append({
-                        "Name": name,
-                        "Phone": phone,
-                        "Website": website,
-                        "Rating": rating,
-                        "Address": location,
-                        "Category": keyword,
-                        "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}"
+                    link_el = item.select_one('a.result__url, .result__url')
+                    if link_el:
+                        href = link_el.get('href', '') or link_el.get_text(strip=True)
+                        if href and not href.startswith('http'):
+                            href = 'https://' + href
+                        if self.is_valid_website(href):
+                            website = href
+
+                    snippet = item.get_text(separator=' ', strip=True)
+                    rating = "N/A"
+                    rm = re.search(r'\b([1-5][.,]\d)\b', snippet)
+                    if rm:
+                        rv = rm.group(1).replace(',', '.')
+                        try:
+                            if 1.0 <= float(rv) <= 5.0:
+                                rating = rv
+                        except:
+                            pass
+
+                    results.append({
+                        "Name":        name,
+                        "Phone":       "N/A",
+                        "Website":     website,
+                        "Rating":      rating,
+                        "ReviewCount": "0",
+                        "Address":     location,
+                        "Category":    keyword,
+                        "Maps_Link":   f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}/",
                     })
-                return batch
-            except Exception:
-                return []
+                except Exception as e:
+                    logger.debug(f"[SCRAPE-DDG] Item error: {e}")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            results = executor.map(get_offset, [0, 20, 40, 60, 80])
-            for res in results:
-                all_leads.extend(res)
-                
-        return all_leads
+        except Exception as e:
+            logger.warning(f"[SCRAPE-DDG] Error: {e}")
 
-# ══════════════════════════════════════════════
-#   2. DEEP EMAIL EXTRACTOR
-# ══════════════════════════════════════════════
+        logger.info(f"[SCRAPE-DDG] Extracted {len(results)} businesses")
+        return results
+
+    def fetch_batch(self, keyword: str, location: str) -> list:
+        logger.info(f"[SCRAPE] ═══ Starting scrape for keyword: '{keyword}' in '{location}' ═══")
+        all_leads = []
+
+        maps_results = self._scrape_google_maps(keyword, location)
+        logger.info(f"[SCRAPE] Strategy A (Google Maps): {len(maps_results)} businesses")
+        all_leads.extend(maps_results)
+
+        local_results = self._scrape_google_local(keyword, location)
+        logger.info(f"[SCRAPE] Strategy B (Google Local): {len(local_results)} businesses")
+        all_leads.extend(local_results)
+
+        if len(all_leads) < 3:
+            logger.info("[SCRAPE] Insufficient results from Google — trying DuckDuckGo fallback")
+            ddg_results = self._scrape_duckduckgo(keyword, location)
+            logger.info(f"[SCRAPE] Strategy C (DuckDuckGo): {len(ddg_results)} businesses")
+            all_leads.extend(ddg_results)
+
+        seen_names = set()
+        unique_leads = []
+        for lead in all_leads:
+            key = lead["Name"].strip().lower()
+            if key not in seen_names and key != "n/a" and len(key) > 2:
+                seen_names.add(key)
+                unique_leads.append(lead)
+
+        def sort_key(lead):
+            try:
+                return float(lead["Rating"])
+            except:
+                return 6.0
+
+        unique_leads.sort(key=sort_key)
+
+        logger.info(
+            f"[SCRAPE] ✅ TOTAL for '{keyword}': "
+            f"{len(all_leads)} raw → {len(unique_leads)} unique (bad-rating-first order)"
+        )
+        return unique_leads
+
+    # [PROBLEM 1] Step 3: Search Google then DuckDuckGo for the official website.
+    # Uses the is_valid_website validator to reject Maps/aggregator links.
+    def find_website_via_search(self, business_name: str, location: str) -> str:
+        query = urllib.parse.quote_plus(f"{business_name} {location} official website")
+
+        # 1. Google Search
+        try:
+            url = f"https://www.google.com/search?q={query}&num=5&hl=en"
+            resp = requests.get(url, headers=get_headers(), timeout=8, verify=False)
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            for a in soup.select('a[href]'):
+                href = a.get('href', '')
+                if '/url?q=' in href:
+                    clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
+                    if self.is_valid_website(clean):
+                        logger.info(f"[WEBSITE-SEARCH] Found via Google for '{business_name}': {clean}")
+                        return clean
+        except Exception as e:
+            logger.debug(f"[WEBSITE-SEARCH] Google search failed: {e}")
+
+        # 2. DuckDuckGo Fallback
+        try:
+            url_ddg = f"https://html.duckduckgo.com/html/?q={query}"
+            resp_ddg = requests.get(url_ddg, headers=get_headers(), timeout=8, verify=False)
+            soup_ddg = BeautifulSoup(resp_ddg.text, 'html.parser')
+            for a in soup_ddg.select('a.result__url, .result__url'):
+                href = a.get('href', '') or a.get_text(strip=True)
+                if href and not href.startswith('http'):
+                    href = 'https://' + href
+                if self.is_valid_website(href):
+                    logger.info(f"[WEBSITE-SEARCH] Found via DDG for '{business_name}': {href}")
+                    return href
+        except Exception as e:
+            logger.debug(f"[WEBSITE-SEARCH] DDG failed: {e}")
+
+        return "N/A"
+
+
+# ════════════════════════════════════════════════════
+#   DEEP EMAIL EXTRACTOR
+# ════════════════════════════════════════════════════
 class DeepEmailExtractor:
     def __init__(self):
         self.email_regex = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
-        self.bad_keywords = ['example', 'domain', 'sentry', '@2x', '.png', '.jpg', '.jpeg', '.gif', 'wixpress', 'bootstrap', 'rating']
+        self.bad_keywords = [
+            'example', 'domain', 'sentry', '@2x', '.png', '.jpg',
+            '.jpeg', '.gif', 'wixpress', 'bootstrap', 'rating',
+            'schema', 'jquery', 'cloudflare', 'wordpress', 'email@email',
+            'youremail', 'name@', 'user@', 'test@', 'info@info',
+        ]
+        self.CONTACT_PATHS = [
+            '/contact', '/contact-us', '/contactus',
+            '/about', '/about-us', '/aboutus',
+            '/support', '/help', '/info', '/reach-us',
+            '/get-in-touch', '/getintouch',
+        ]
 
-    def is_valid_email(self, email):
+    def is_valid_email(self, email: str) -> bool:
         email = email.lower()
+        if len(email) > 80 or '.' not in email.split('@')[-1]:
+            return False
         return not any(bad in email for bad in self.bad_keywords)
 
-    def get_email(self, url):
-        if not url or url == "N/A": return "N/A"
-        if not url.startswith('http'): url = 'http://' + url
-        
-        visited_urls = set()
-        
+    def extract_from_html(self, html: str) -> list:
+        emails = set()
+        emails.update(re.findall(self.email_regex, html))
+        for ob in re.findall(
+            r'[a-zA-Z0-9._%+\-]+\s*[\[\(]at[\]\)]\s*[a-zA-Z0-9.\-]+\s*[\[\(]dot[\]\)]\s*[a-zA-Z]{2,}',
+            html, re.IGNORECASE
+        ):
+            cleaned = (ob.replace('[at]', '@').replace('(at)', '@')
+                         .replace('[dot]', '.').replace('(dot)', '.').replace(' ', ''))
+            if '@' in cleaned:
+                emails.add(cleaned.lower())
+        emails.update(re.findall(
+            r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', html
+        ))
+        return [e for e in emails if self.is_valid_email(e)]
+
+    def crawl_page(self, url: str, timeout: int = 8) -> str:
         try:
-            r = requests.get(url, headers=get_headers(), timeout=6, verify=False)
-            visited_urls.add(url)
-            
-            emails = list(set(re.findall(self.email_regex, r.text)))
-            valid_emails = [e for e in emails if self.is_valid_email(e)]
-            if valid_emails: return valid_emails[0]
-            
-            soup = BeautifulSoup(r.text, 'html.parser')
-            internal_links = []
-            for a in soup.select('a[href]'):
-                href = a.get('href', '').lower()
-                if any(kw in href for kw in ['contact', 'about', 'support', 'help']):
-                    full_link = urllib.parse.urljoin(url, a['href'])
-                    if full_link not in visited_urls and full_link.startswith('http'):
-                        internal_links.append(full_link)
-            
-            for link in list(set(internal_links))[:3]:
-                try:
-                    r2 = requests.get(link, headers=get_headers(), timeout=6, verify=False)
-                    visited_urls.add(link)
-                    emails2 = list(set(re.findall(self.email_regex, r2.text)))
-                    valid_emails2 = [e for e in emails2 if self.is_valid_email(e)]
-                    if valid_emails2: return valid_emails2[0]
-                except:
+            r = requests.get(url, headers=get_headers(), timeout=timeout,
+                             verify=False, allow_redirects=True)
+            if r.status_code == 200:
+                return r.text
+        except Exception as e:
+            logger.debug(f"[EMAIL] Crawl failed for {url}: {e}")
+        return ""
+
+    def get_internal_links(self, html: str, base_url: str) -> list:
+        soup = BeautifulSoup(html, 'html.parser')
+        CONTACT_KEYWORDS = ['contact', 'about', 'support', 'help', 'reach',
+                            'connect', 'get-in-touch', 'getintouch', 'info', 'team']
+        links = []
+        for a in soup.select('a[href]'):
+            href = a.get('href', '').lower()
+            if any(kw in href for kw in CONTACT_KEYWORDS):
+                full_link = urllib.parse.urljoin(base_url, a['href'])
+                if full_link.startswith('http'):
+                    links.append(full_link)
+        return list(set(links))
+
+    def get_email(self, url: str) -> str:
+        if not url or url == "N/A":
+            return "N/A"
+        if not url.startswith('http'):
+            url = 'https://' + url
+        visited = set()
+        base = url.rstrip('/')
+
+        try:
+            html = self.crawl_page(url)
+            if html:
+                visited.add(url)
+                emails = self.extract_from_html(html)
+                if emails:
+                    logger.debug(f"[EMAIL] Found on homepage: {emails[0]}")
+                    return emails[0]
+
+                internal_links = self.get_internal_links(html, url)
+                for link in internal_links[:4]:
+                    if link in visited:
+                        continue
+                    page_html = self.crawl_page(link)
+                    visited.add(link)
+                    if page_html:
+                        emails2 = self.extract_from_html(page_html)
+                        if emails2:
+                            logger.debug(f"[EMAIL] Found on internal page {link}: {emails2[0]}")
+                            return emails2[0]
+
+            for path in self.CONTACT_PATHS:
+                attempt = base + path
+                if attempt in visited:
                     continue
-                    
-        except: pass
+                page_html = self.crawl_page(attempt, timeout=6)
+                visited.add(attempt)
+                if page_html:
+                    emails3 = self.extract_from_html(page_html)
+                    if emails3:
+                        logger.debug(f"[EMAIL] Found at {attempt}: {emails3[0]}")
+                        return emails3[0]
+
+        except Exception as e:
+            logger.debug(f"[EMAIL] get_email failed for {url}: {e}")
+
         return "N/A"
 
-# ══════════════════════════════════════════════
-#   3. AI KEYWORD GENERATOR & PERSONALIZER
-# ══════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════
+#   AI KEYWORD GENERATOR  (original — preserved)
+# ════════════════════════════════════════════════════
 def generate_ai_keywords(base_kw, location, used_kws):
-    fallback = [f"best {base_kw}", f"top {base_kw}", f"{base_kw} services", f"affordable {base_kw}", f"{base_kw} agency", f"{base_kw} near me", f"{base_kw} company", f"{base_kw} experts"]
-    if not GROQ_API_KEY: return fallback
+    fallback = [
+        f"best {base_kw}", f"top {base_kw}", f"{base_kw} services",
+        f"affordable {base_kw}", f"{base_kw} agency", f"{base_kw} near me",
+        f"{base_kw} company", f"{base_kw} experts",
+    ]
+    if not GROQ_API_KEY:
+        return fallback
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        # UPGRADED: Now asks for 100+ keywords to ensure massive pool
-        prompt = f"I am searching for '{base_kw}' in '{location}'. Used keywords: {list(used_kws)}. Generate 100 NEW, highly related search terms/categories. Return ONLY a comma-separated list."
+        prompt = (
+            f'I am searching for "{base_kw}" in "{location}". '
+            f'Used keywords: {list(used_kws)}. '
+            f'Generate 100 NEW, highly related search terms/categories. '
+            f'Return ONLY a comma-separated list.'
+        )
         res = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama3-8b-8192",
             temperature=0.7,
         )
         text = res.choices[0].message.content
-        new_kws = [k.strip() for k in text.split(',') if k.strip() and k.strip().lower() not in used_kws]
+        new_kws = [
+            k.strip() for k in text.split(',')
+            if k.strip() and k.strip().lower() not in used_kws
+        ]
         return new_kws if new_kws else fallback
-    except:
+    except Exception as e:
+        logger.warning(f"[KEYWORDS] generate_ai_keywords failed: {e}")
         return fallback
 
+
+# ════════════════════════════════════════════════════
+#   AI EMAIL PERSONALIZER  (original — preserved)
+# ════════════════════════════════════════════════════
 def personalize_email(lead_name, niche, template_subject, template_body, rating):
-    if not GROQ_API_KEY: return template_subject, template_body, ""
+    if not GROQ_API_KEY:
+        return template_subject, template_body, ""
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        # UPGRADED: Now generates a specific personalization line based on rating/niche
-        prompt = f"""
-        You are an expert cold email copywriter. Personalize this email for a business.
-        Business Name: {lead_name}
-        Niche: {niche}
-        Current Rating: {rating} (If below 4.0, mention helping them improve it. If high, compliment it).
-        Original Subject: {template_subject}
-        Original Body: {template_body}
-        
-        Return ONLY a valid JSON object with keys:
-        "subject" (personalized subject),
-        "body" (personalized HTML body),
-        "personalization_line" (A single, highly personalized opening sentence based on their business and rating).
-        """
+        prompt = f"""You are an expert cold email copywriter. Personalize this email for a business.
+Business Name: {lead_name}
+Niche: {niche}
+Current Rating: {rating} (If below 4.0, mention helping them improve it. If high, compliment it).
+Original Subject: {template_subject}
+Original Body: {template_body}
+
+Return ONLY a valid JSON object with keys:
+"subject" (personalized subject),
+"body" (personalized HTML body),
+"personalization_line" (A single, highly personalized opening sentence based on their business and rating)."""
         res = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama3-8b-8192",
@@ -217,689 +1025,1137 @@ def personalize_email(lead_name, niche, template_subject, template_body, rating)
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group(0))
-            return data.get("subject", template_subject), data.get("body", template_body), data.get("personalization_line", "")
+            return (
+                data.get("subject", template_subject),
+                data.get("body", template_body),
+                data.get("personalization_line", ""),
+            )
         return template_subject, template_body, ""
     except Exception as e:
+        logger.warning(f"[EMAIL-AI] personalize_email failed: {e}")
         return template_subject, template_body, ""
 
-# ══════════════════════════════════════════════
-#   4. MASTER EXECUTION THREAD (Scrape + DB + Email)
-# ══════════════════════════════════════════════
-def run_job_thread(job_id, data):
+
+# ════════════════════════════════════════════════════
+#   MASTER JOB RUNNER
+#
+#   [PROBLEM 2] KEYWORD FLOW — STRICT ONE-BY-ONE:
+#     1. Start with base keyword in pending_keywords
+#     2. Pop ONE keyword → scrape → process ALL leads fully
+#     3. Only when pending_keywords is empty AND target not met
+#        do we call generate_single_keyword() to add ONE more keyword
+#     4. Never generate a batch of keywords
+#
+#   [STOP FEATURE] Every loop checks _should_stop(job_id).
+# ════════════════════════════════════════════════════
+
+def run_job_thread(job_id: str, data: dict):
+    # [BUG FIX] Initialise job dict BEFORE any early-return paths so the
+    # status endpoint never encounters a missing key.
+    jobs[job_id] = {
+        'status':        'starting',
+        'count':         0,
+        'leads':         [],
+        'emails_sent':   0,
+        'total_to_send': 0,
+        'status_text':   'Initialising…',
+        'is_running':    True,
+        'stats': {
+            'scraped_total':       0,
+            'after_rating_filter': 0,
+            'duplicates_skipped':  0,
+            'emails_found':        0,
+            'errors':              0,
+            'keywords_used':       0,
+            'keywords_generated':  0,
+        },
+    }
+
     try:
-        location = data.get('location')
-        base_keyword = data.get('keyword')
-        max_leads = min(int(data.get('max_leads', 10)), 200)
-        max_rating = data.get('max_rating')
-        webhook_url = data.get('webhook_url')
-        db_webhook_url = data.get('db_webhook_url') # NEW: DB Webhook
-        templates = data.get('templates', [])
-        
-        maps_scraper = GoogleMapsScraper()
-        email_lib = DeepEmailExtractor()
-        db = GoogleSheetsDB(db_webhook_url)
-        
-        jobs[job_id] = {'status': 'scraping', 'count': 0, 'leads': [], 'status_text': 'Starting AI Keyword Generation...'}
-        
-        # [DB] Initialize Sheets & Config
+        location     = data.get('location', '').strip()
+        base_keyword = data.get('keyword', '').strip()
+        max_leads    = min(int(data.get('max_leads', 10)), 200)
+        max_rating   = data.get('max_rating')
+        webhook_url    = data.get('webhook_url', '')
+        db_webhook_url = data.get('db_webhook_url', '')
+        templates      = data.get('templates', [])
+
+        max_rating_float = None
+        if max_rating:
+            try:
+                max_rating_float = float(str(max_rating).replace(',', '.'))
+                logger.info(f"[JOB] Rating filter active: rating <= {max_rating_float}")
+            except:
+                logger.warning(f"[JOB] Invalid max_rating value '{max_rating}' — filter disabled")
+
+        maps_scraper   = GoogleMapsScraper()
+        email_lib      = DeepEmailExtractor()
+        kw_engine      = AdvancedKeywordEngine()
+        db             = GoogleSheetsDB(db_webhook_url)
+        dedup          = DeduplicationStore()
+
+        jobs[job_id].update({
+            'status':      'scraping',
+            'status_text': f'Starting scrape for: {base_keyword} in {location}...',
+        })
+
         if db_webhook_url:
             db.send_action("init", {})
             db.send_action("update_config", {
-                "keyword_seed": base_keyword, "location": location, "target_leads": max_leads,
-                "min_rating": "", "max_rating": max_rating or "", "email_required": "true", "status": "running"
+                "keyword_seed": base_keyword, "location": location,
+                "target_leads": max_leads, "min_rating": "",
+                "max_rating": max_rating or "", "email_required": "true",
+                "status": "running",
             })
-            db.log("System Start", f"Started job for {base_keyword} in {location}")
+            db.log("Job Start", f"keyword='{base_keyword}' location='{location}' target={max_leads}")
 
-        seen_names = set()
-        used_keywords = set()
-        pending_keywords = [base_keyword]
-        
-        # --- PHASE 1: STRICT SCRAPING (UNTIL TARGET HIT) ---
-        while len(jobs[job_id]['leads']) < max_leads:
-            
-            if not pending_keywords:
-                jobs[job_id]['status_text'] = f"Generating 100+ new keywords for '{base_keyword}'..."
-                new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
-                pending_keywords.extend(new_kws)
-                
-                # [DB] Save generated keywords
-                for kw in new_kws:
-                    db.send_action("add_keyword", {"keyword": kw, "source_seed": base_keyword, "status": "pending"})
-                
-            current_kw = pending_keywords.pop(0)
-            used_keywords.add(current_kw.lower())
-            
-            jobs[job_id]['status_text'] = f"Searching Google Maps for: {current_kw}..."
-            raw_leads = maps_scraper.fetch_batch(current_kw, location)
-            
-            if not raw_leads:
-                continue 
-            
+        used_keywords    = set()
+        pending_keywords = [base_keyword]  # [PROBLEM 2] Start with ONLY the base keyword
+
+        def _process_lead_batch(raw_leads: list, current_kw: str) -> bool:
+            """
+            Process one batch — filter, find website, extract email, deduplicate, save.
+            Returns True if the target was reached OR a stop was requested.
+            [PROBLEM 2] This function fully processes every lead before the caller
+            generates the next keyword, enforcing the strict one-at-a-time flow.
+            """
+            jobs[job_id]['stats']['scraped_total'] += len(raw_leads)
+            logger.info(f"[JOB] Processing {len(raw_leads)} businesses from keyword '{current_kw}'")
+
             for lead in raw_leads:
+                # [STOP FEATURE] Check stop flag before each lead
+                if _should_stop(job_id):
+                    logger.info(f"[JOB] 🛑 STOP requested — breaking lead processing loop")
+                    return True
+
                 if len(jobs[job_id]['leads']) >= max_leads:
-                    break # Target Hit!
-                    
-                if lead['Name'] in seen_names:
-                    continue
-                
-                # [DB] Save raw scraped business
+                    logger.info(f"[JOB] 🎯 TARGET REACHED: {max_leads} leads — stopping")
+                    return True
+
+                logger.info(f"[JOB] Processing: '{lead['Name']}' | rating={lead['Rating']} | website={lead['Website']}")
+
+                # [PROBLEM 4] Maps URL preserved throughout
+                maps_url = lead.get('Maps_Link', 'N/A')
+
                 db.send_action("add_scraped", {
-                    "business_name": lead['Name'], "address": lead['Address'], "phone": lead['Phone'],
-                    "rating": lead['Rating'], "review_count": "N/A", "website": lead['Website'],
-                    "keyword": current_kw, "status": "scraped"
+                    "business_name": lead['Name'],
+                    "address":       lead['Address'],
+                    "phone":         lead['Phone'],
+                    "rating":        lead['Rating'],
+                    "review_count":  lead.get('ReviewCount', 'N/A'),
+                    "website":       lead['Website'],
+                    "maps_url":      maps_url,
+                    "keyword":       current_kw,
+                    "status":        "scraped",
                 })
 
-                # Apply Rating Filter
-                if max_rating and lead['Rating'] != "N/A":
+                # Rating filter
+                if max_rating_float is not None and lead['Rating'] != "N/A":
                     try:
-                        if float(lead['Rating']) > float(max_rating): continue
-                    except: pass
+                        r_val = float(lead['Rating'])
+                        if r_val > max_rating_float:
+                            logger.info(f"[FILTER] ❌ SKIPPED '{lead['Name']}' rating={r_val} > max={max_rating_float}")
+                            continue
+                        else:
+                            logger.info(f"[FILTER] ✅ ACCEPTED '{lead['Name']}' rating={r_val} <= max={max_rating_float}")
+                    except ValueError:
+                        logger.debug(f"[FILTER] Cannot parse rating '{lead['Rating']}' for '{lead['Name']}' — allowing through")
 
-                if lead['Website'] == "N/A":
-                    continue 
-                    
-                jobs[job_id]['status_text'] = f"Deep searching email for: {lead['Name']}..."
-                extracted_email = email_lib.get_email(lead['Website'])
-                
+                jobs[job_id]['stats']['after_rating_filter'] += 1
+
+                # ── [PROBLEM 1] THREE-STEP WEBSITE EXTRACTION ──────────────
+                # Step 1: Use what was parsed from the listing
+                website = lead['Website']
+                if not maps_scraper.is_valid_website(website):
+                    website = "N/A"
+
+                # Step 2: If still missing, mine the Maps detail page JSON blob
+                if website == "N/A" and maps_url != "N/A":
+                    jobs[job_id]['status_text'] = f"Checking Maps detail page for: {lead['Name']}..."
+                    logger.info(f"[WEBSITE] Step 2 — checking Maps detail page...")
+                    website = maps_scraper.fetch_website_from_details(maps_url)
+
+                # Step 3: If still missing, fall back to Google/DDG search
+                if website == "N/A":
+                    jobs[job_id]['status_text'] = f"Searching for website: {lead['Name']}..."
+                    logger.info(f"[WEBSITE] Step 3 — searching Google/DDG...")
+                    website = maps_scraper.find_website_via_search(lead['Name'], location)
+
+                lead['Website'] = website
+                if website != "N/A":
+                    logger.info(f"[WEBSITE] ✅ Found: {website}")
+                else:
+                    logger.info(f"[WEBSITE] ❌ Not found for '{lead['Name']}' — skipping lead")
+                    continue
+                # ───────────────────────────────────────────────────────────
+
+                # [PROBLEM 5] Pre-email deduplication (by website / name+location)
+                if dedup.is_duplicate(lead['Name'], location, website, ""):
+                    dedup.mark_skipped()
+                    jobs[job_id]['stats']['duplicates_skipped'] = dedup.skipped
+                    logger.info(f"[DEDUP] ⚠ Pre-email duplicate: '{lead['Name']}'")
+                    continue
+
+                # [STOP FEATURE] Check before slow email extraction
+                if _should_stop(job_id):
+                    logger.info(f"[JOB] 🛑 STOP requested — aborting before email extraction")
+                    return True
+
+                jobs[job_id]['status_text'] = f"Extracting email from: {lead['Name']}..."
+                extracted_email = email_lib.get_email(website)
+
                 if extracted_email == "N/A":
-                    continue 
-                
-                # [DB] Save Email Lead
+                    logger.info(f"[EMAIL] ❌ No email found for '{lead['Name']}' at {website}")
+                    continue
+
+                jobs[job_id]['stats']['emails_found'] += 1
+                logger.info(f"[EMAIL] ✅ Found: {extracted_email} for '{lead['Name']}'")
+
+                # [PROBLEM 5] Post-email deduplication (by email / website / name+location)
+                if dedup.is_duplicate(lead['Name'], location, website, extracted_email):
+                    dedup.mark_skipped()
+                    jobs[job_id]['stats']['duplicates_skipped'] = dedup.skipped
+                    logger.info(f"[DEDUP] ⚠ Post-email duplicate: '{lead['Name']}' / {extracted_email}")
+                    continue
+
+                dedup.register(lead['Name'], location, website, extracted_email)
+
+                # [PROBLEM 6] Save ALL available data to DB
                 db.send_action("add_email_lead", {
-                    "business_name": lead['Name'], "website": lead['Website'],
-                    "email": extracted_email, "source_page": lead['Website'], "status": "qualified"
+                    "business_name": lead['Name'], "website": website,
+                    "email": extracted_email, "source_page": website, "status": "qualified",
                 })
-                
-                # [DB] Move to Qualified Leads
                 db.send_action("add_qualified", {
-                    "business_name": lead['Name'], "email": extracted_email, "website": lead['Website'],
-                    "rating": lead['Rating'], "keyword": current_kw, "personalization_line": "Pending AI...", "email_sent": "no"
+                    "business_name": lead['Name'],
+                    "address":       lead['Address'],
+                    "phone":         lead['Phone'],
+                    "rating":        lead['Rating'],
+                    "review_count":  lead.get('ReviewCount', 'N/A'),
+                    "website":       website,
+                    "email":         extracted_email,
+                    "maps_url":      maps_url,          # [PROBLEM 4] Maps URL in qualified sheet
+                    "keyword":       current_kw,
+                    "personalization_line": "Pending AI...",
+                    "email_sent":    "no",
                 })
 
                 lead['Email'] = extracted_email
-                seen_names.add(lead['Name'])
                 jobs[job_id]['leads'].append(lead)
                 jobs[job_id]['count'] = len(jobs[job_id]['leads'])
-                
-                jobs[job_id]['status_text'] = f"🎯 Found {jobs[job_id]['count']}/{max_leads} valid emails! (Latest: {lead['Email']})"
-                
-            time.sleep(1)
-            
-        final_leads = jobs[job_id]['leads']
-        
-        # [DB] Update Config to Stopped
+                jobs[job_id]['stats']['duplicates_skipped'] = dedup.skipped
+
+                logger.info(
+                    f"[LEAD] ✅ #{jobs[job_id]['count']}/{max_leads} "
+                    f"'{lead['Name']}' | rating={lead['Rating']} | {extracted_email}"
+                )
+                jobs[job_id]['status_text'] = (
+                    f"✅ {jobs[job_id]['count']}/{max_leads} leads found! "
+                    f"Latest: {lead['Name']} ({extracted_email})"
+                )
+
+                if len(jobs[job_id]['leads']) >= max_leads:
+                    logger.info(f"[JOB] 🎯 TARGET REACHED inside batch — stopping")
+                    return True
+
+            return False
+
+        # ════════════════════════════════════════════════════════════
+        # MAIN LOOP — STRICT ONE-BY-ONE KEYWORD FLOW [PROBLEM 2]
+        #
+        # Flow:
+        #   1. Pop ONE keyword from pending_keywords
+        #   2. Scrape it
+        #   3. Fully process all leads (_process_lead_batch)
+        #   4. If target not met AND pending empty → generate ONE new keyword
+        #   5. Repeat
+        # ════════════════════════════════════════════════════════════
+        while len(jobs[job_id]['leads']) < max_leads:
+
+            # Check stop flag at start of every main loop iteration
+            if _should_stop(job_id):
+                logger.info(f"[JOB] 🛑 STOP requested — exiting main keyword loop")
+                break
+
+            if not pending_keywords:
+                # Only reach here if the previous keyword's leads were fully processed
+                # and target is still not met → generate EXACTLY ONE new keyword
+                if _should_stop(job_id):
+                    break
+
+                jobs[job_id]['status_text'] = f"Generating next keyword for '{base_keyword}'..."
+                logger.info(f"[JOB] Target not reached ({len(jobs[job_id]['leads'])}/{max_leads}). Generating ONE new keyword...")
+
+                new_kw = kw_engine.generate_single_keyword(base_keyword, location, used_keywords)
+
+                if new_kw:
+                    pending_keywords.append(new_kw)
+                    jobs[job_id]['stats']['keywords_generated'] += 1
+                    logger.info(f"[JOB] New keyword queued: '{new_kw}'")
+                    db.send_action("add_keyword", {
+                        "keyword": new_kw, "source_seed": base_keyword, "status": "pending"
+                    })
+                else:
+                    logger.info("[JOB] Keyword pool exhausted — stopping.")
+                    break
+
+            current_kw = pending_keywords.pop(0)
+            used_keywords.add(current_kw.lower())
+            jobs[job_id]['stats']['keywords_used'] += 1
+
+            jobs[job_id]['status_text'] = (
+                f"Scraping keyword {jobs[job_id]['stats']['keywords_used']}: "
+                f"'{current_kw}' in '{location}'..."
+            )
+            logger.info(
+                f"[JOB] ── Keyword #{jobs[job_id]['stats']['keywords_used']}: "
+                f"'{current_kw}' | leads so far: {len(jobs[job_id]['leads'])}/{max_leads}"
+            )
+
+            if _should_stop(job_id):
+                logger.info(f"[JOB] 🛑 STOP — not starting scrape for '{current_kw}'")
+                break
+
+            raw_leads = maps_scraper.fetch_batch(current_kw, location)
+
+            if not raw_leads:
+                logger.info(f"[JOB] No businesses found for '{current_kw}' — moving to next keyword")
+                time.sleep(random.uniform(1.0, 2.5))
+                continue
+
+            logger.info(f"[JOB] {len(raw_leads)} businesses found for '{current_kw}'")
+
+            target_reached = _process_lead_batch(raw_leads, current_kw)
+
+            if target_reached:
+                logger.info(f"[JOB] STOP CONDITION: target reached or stop requested")
+                break
+
+            logger.info(
+                f"[JOB] Leads so far: {len(jobs[job_id]['leads'])}/{max_leads} "
+                f"— pending queue: {len(pending_keywords)} keyword(s) — will generate next"
+            )
+            time.sleep(random.uniform(1.0, 2.0))
+
+        # ── Final stats ──
+        s = jobs[job_id]['stats']
+        final_count  = len(jobs[job_id]['leads'])
+        stopped_early = _should_stop(job_id)
+
+        logger.info(
+            f"[JOB] ═══ SCRAPING {'STOPPED' if stopped_early else 'COMPLETE'} ═══\n"
+            f"  scraped_total     : {s['scraped_total']}\n"
+            f"  after_filter      : {s['after_rating_filter']}\n"
+            f"  emails_found      : {s['emails_found']}\n"
+            f"  duplicates_skipped: {s['duplicates_skipped']}\n"
+            f"  keywords_used     : {s['keywords_used']}\n"
+            f"  keywords_generated: {s['keywords_generated']}\n"
+            f"  final_leads       : {final_count}"
+        )
         db.send_action("update_config", {
-            "keyword_seed": base_keyword, "location": location, "target_leads": max_leads,
-            "min_rating": "", "max_rating": max_rating or "", "email_required": "true", "status": "stopped"
+            "keyword_seed": base_keyword, "location": location,
+            "target_leads": max_leads, "min_rating": "",
+            "max_rating": max_rating or "", "email_required": "true",
+            "status": "stopped" if stopped_early else "done",
         })
-        db.log("Scraping Stopped", f"Target reached. Total qualified: {len(final_leads)}")
-        
-        # --- PHASE 2: AUTOMATED EMAIL SENDING ---
-        if webhook_url and templates and len(final_leads) > 0:
+        db.log("Scraping Done", f"Qualified: {final_count} | Keywords used: {s['keywords_used']}")
+
+        final_leads = jobs[job_id]['leads']
+
+        # ════════════════════════════════════════════════════
+        # PHASE 2: SEND EMAILS (skip if stopped)
+        # ════════════════════════════════════════════════════
+        if webhook_url and templates and final_leads and not stopped_early:
             jobs[job_id]['status'] = 'sending_emails'
             jobs[job_id]['total_to_send'] = len(final_leads)
             emails_sent = 0
-            
+
             for lead in final_leads:
-                jobs[job_id]['status_text'] = f"Sending personalized email {emails_sent+1}/{jobs[job_id]['total_to_send']} to {lead['Email']}..."
-                
+                if _should_stop(job_id):
+                    logger.info(f"[JOB] 🛑 STOP — aborting email send loop")
+                    break
+
+                jobs[job_id]['status_text'] = (
+                    f"Sending email {emails_sent + 1}/{len(final_leads)} → {lead['Email']}"
+                )
                 template = random.choice(templates)
-                # UPGRADED: Now generates personalization line
-                p_subject, p_body, p_line = personalize_email(lead['Name'], base_keyword, template['subject'], template['body'], lead['Rating'])
-                
+                p_subject, p_body, p_line = personalize_email(
+                    lead['Name'], base_keyword,
+                    template['subject'], template['body'], lead['Rating']
+                )
                 payload = {"to": lead['Email'], "subject": p_subject, "body": p_body}
                 try:
                     requests.post(webhook_url, json=payload, timeout=10)
                     emails_sent += 1
                     jobs[job_id]['emails_sent'] = emails_sent
-                    
-                    # [DB] Update Email Sent Status & Personalization Line
-                    db.send_action("update_email_sent", {"email": lead['Email'], "personalization_line": p_line})
-                    db.log("Email Sent", f"Sent to {lead['Email']}")
+                    db.send_action("update_email_sent", {
+                        "email": lead['Email'], "personalization_line": p_line
+                    })
+                    db.log("Email Sent", f"→ {lead['Email']}")
+                    logger.info(f"[EMAIL-SEND] ✅ Sent to {lead['Email']}")
                 except Exception as e:
-                    print(f"Failed to send email to {lead['Email']}: {e}")
-                
-                if emails_sent < jobs[job_id]['total_to_send']:
+                    jobs[job_id]['stats']['errors'] += 1
+                    logger.error(f"[EMAIL-SEND] ❌ Failed → {lead['Email']}: {e}")
+
+                if emails_sent < len(final_leads) and not _should_stop(job_id):
                     delay = random.randint(60, 120)
                     for i in range(delay, 0, -1):
-                        jobs[job_id]['status_text'] = f"Anti-Spam: Waiting {i}s before sending next email..."
+                        if _should_stop(job_id):
+                            logger.info(f"[JOB] 🛑 STOP during cooldown")
+                            break
+                        jobs[job_id]['status_text'] = (
+                            f"Anti-spam cooldown: {i}s before next email..."
+                        )
                         time.sleep(1)
-        
-        # --- FINISHED ---
-        jobs[job_id]['status'] = 'done'
-        jobs[job_id]['status_text'] = 'Process Completed Successfully!'
-        db.log("Job Complete", "All tasks finished successfully.")
-        
-    except Exception as e:
-        jobs[job_id] = {'status': 'error', 'error': str(e)}
-        if 'db' in locals(): db.log("Error", str(e))
 
-# ══════════════════════════════════════════════
-#   FLASK DASHBOARD & API
-# ══════════════════════════════════════════════
+        # Final status
+        if _should_stop(job_id):
+            jobs[job_id]['status'] = 'stopped'
+            jobs[job_id]['status_text'] = f"🛑 Stopped by user. {final_count} leads collected."
+        else:
+            jobs[job_id]['status'] = 'done'
+            jobs[job_id]['status_text'] = f"✅ Completed! {final_count} qualified leads found."
+
+        jobs[job_id]['is_running'] = False
+        db.log("Job Complete", f"All tasks finished. Leads: {final_count}")
+        logger.info(f"[JOB] ✅ JOB {job_id} COMPLETE — {final_count} leads")
+
+    except Exception as e:
+        logger.error(f"[JOB] ❌ Fatal error in job {job_id}: {e}", exc_info=True)
+        # [BUG FIX] jobs[job_id] is always initialised at the top so this is safe
+        jobs[job_id]['status']     = 'error'
+        jobs[job_id]['error']      = str(e)
+        jobs[job_id]['is_running'] = False
+
+
+# ════════════════════════════════════════════════════
+#   FLASK APP + UI
+# ════════════════════════════════════════════════════
 flask_app = Flask(__name__)
-jobs = {}
+jobs: dict = {}
+
+# [REFRESH FIX] Track latest job for page-reload state restoration
+latest_job_id: str = None
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LeadGen Pro | Auto Emailer & DB</title>
-<script src="https://cdn.tailwindcss.com"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>LeadGen Pro</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
 <style>
-*{box-sizing:border-box}
-body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;min-height:100vh}
-.card{background:rgba(15,23,42,0.85);border:1px solid rgba(99,102,241,0.12);border-radius:16px}
-.card-hover{transition:all .2s}
-.card-hover:hover{border-color:rgba(99,102,241,0.35);transform:translateY(-2px)}
-.btn-p{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
-.btn-p:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(79,70,229,0.4)}
-.btn-p:disabled{opacity:.45;cursor:not-allowed;transform:none;filter:none}
-.btn-g{background:linear-gradient(135deg,#059669,#0d9488);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
-.btn-g:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(5,150,105,0.4)}
-.btn-b{background:linear-gradient(135deg,#2563eb,#3b82f6);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
-.btn-b:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(37,99,235,0.4)}
-.inp{background:#0f172a;border:1px solid #1e293b;color:#e2e8f0;border-radius:10px;padding:11px 15px;font-size:13px;width:100%;transition:border .2s;outline:none}
-.inp:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,0.12)}
-.tab{border-radius:9px;padding:9px 18px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;border:1px solid transparent;color:#64748b;background:transparent}
-.tab.on{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;box-shadow:0 3px 12px rgba(79,70,229,0.35)}
-.tab:not(.on):hover{background:rgba(79,70,229,0.08);color:#a5b4fc}
-.prog{height:4px;background:#1e293b;border-radius:99px;overflow:hidden}
-.prog-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,#4f46e5,#7c3aed);transition:width .6s ease}
-.pill{padding:1px 7px;border-radius:6px;font-size:11px;font-weight:600;display:inline-block}
-.pg{background:rgba(5,150,105,0.12);color:#34d399}
-.pr{background:rgba(239,68,68,0.09);color:#f87171}
-.pb{background:rgba(59,130,246,0.1);color:#60a5fa}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f5f4f0;--surface:#ffffff;--surface2:#f0efe9;--border:#e2e0d8;
+  --ink:#1a1916;--ink2:#6b6860;--ink3:#a09e97;
+  --accent:#d4522a;--accent-h:#b8431f;
+  --green:#1e8a5e;--amber:#c9820a;--red:#c0392b;--blue:#2962a8;
+  --shadow:0 1px 3px rgba(0,0,0,.07),0 4px 16px rgba(0,0,0,.05);
+  --radius:10px;
+}
+html{font-size:16px}
+body{background:var(--bg);color:var(--ink);font-family:'Outfit',system-ui,sans-serif;min-height:100vh;-webkit-font-smoothing:antialiased}
+h1,h2,h3,.syne{font-family:'Syne',sans-serif}
+.container{max-width:900px;margin:0 auto;padding:0 16px}
+.nav{background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:40}
+.nav-inner{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;max-width:900px;margin:0 auto}
+.nav-brand{display:flex;align-items:center;gap:10px}
+.nav-logo{width:34px;height:34px;background:var(--accent);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;flex-shrink:0}
+.nav-title{font-family:'Syne',sans-serif;font-size:16px;font-weight:700;letter-spacing:-.01em}
+.nav-title span{color:var(--accent)}
+.nav-sub{font-size:11px;color:var(--ink3);font-weight:400;margin-top:1px}
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:20px 0}
+@media(max-width:600px){.stats-row{grid-template-columns:repeat(2,1fr)}}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;box-shadow:var(--shadow)}
+.stat-val{font-family:'Syne',sans-serif;font-size:26px;font-weight:700;line-height:1}
+.stat-lbl{font-size:11px;color:var(--ink3);margin-top:4px;font-weight:500;text-transform:uppercase;letter-spacing:.04em}
+.stat-dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px}
+.tab-bar{display:flex;gap:4px;overflow-x:auto;padding-bottom:1px;border-bottom:2px solid var(--border);margin-bottom:20px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.tab-bar::-webkit-scrollbar{display:none}
+.tab-btn{background:none;border:none;padding:9px 14px;font-size:13px;font-weight:600;color:var(--ink3);cursor:pointer;white-space:nowrap;border-bottom:2px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s;font-family:'Outfit',sans-serif;border-radius:6px 6px 0 0}
+.tab-btn:hover{color:var(--ink)}
+.tab-btn.active{color:var(--accent);border-bottom-color:var(--accent)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);margin-bottom:16px}
+.card-title{font-family:'Syne',sans-serif;font-size:14px;font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:16px}
+.card-title i{color:var(--accent);width:16px;text-align:center}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:560px){.form-grid{grid-template-columns:1fr}}
+.form-group{display:flex;flex-direction:column;gap:5px}
+label{font-size:12px;font-weight:600;color:var(--ink2);letter-spacing:.01em;text-transform:uppercase}
+.inp{background:var(--bg);border:1.5px solid var(--border);color:var(--ink);border-radius:8px;padding:10px 13px;font-size:14px;width:100%;font-family:'Outfit',sans-serif;transition:border .15s,box-shadow .15s;outline:none}
+.inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(212,82,42,.1)}
+.inp:disabled{opacity:0.6;cursor:not-allowed;background:var(--surface2)}
+.inp::placeholder{color:var(--ink3)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:none;border-radius:8px;font-weight:600;font-size:14px;cursor:pointer;transition:all .15s;font-family:'Outfit',sans-serif;padding:11px 20px;white-space:nowrap}
+.btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-h);transform:translateY(-1px);box-shadow:0 4px 14px rgba(212,82,42,.3)}
+.btn-success{background:var(--green);color:#fff}
+.btn-success:hover{filter:brightness(1.1);transform:translateY(-1px)}
+.btn-danger{background:var(--red);color:#fff}
+.btn-danger:hover{filter:brightness(1.1);transform:translateY(-1px);box-shadow:0 4px 14px rgba(192,57,43,.3)}
+.btn-neutral{background:var(--surface2);color:var(--ink);border:1.5px solid var(--border)}
+.btn-neutral:hover{border-color:var(--ink2)}
+.btn-ghost{background:none;color:var(--ink3);border:1.5px solid var(--border);font-size:12px;padding:7px 13px}
+.btn-ghost:hover{color:var(--red);border-color:var(--red)}
+.btn-full{width:100%}
+.btn-row{display:flex;gap:10px;margin-top:12px}
+.btn-row .btn{flex:1}
+.status-card{padding:16px;border-radius:var(--radius);border:1.5px solid var(--border);background:var(--surface)}
+.status-header{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.status-icon{font-size:18px;flex-shrink:0}
+.status-label{font-family:'Syne',sans-serif;font-size:14px;font-weight:700}
+.progress-bar{height:4px;background:var(--surface2);border-radius:99px;overflow:hidden;margin-bottom:10px}
+.progress-fill{height:100%;border-radius:99px;background:var(--accent);transition:width .5s ease}
+.status-detail{font-size:12px;color:var(--ink3);font-family:'Outfit',monospace;background:var(--surface2);padding:10px 13px;border-radius:7px;min-height:36px;word-break:break-all;line-height:1.5}
+.debug-stats{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.debug-chip{font-size:11px;padding:3px 9px;border-radius:99px;font-weight:600}
+.chip-blue{background:rgba(41,98,168,.1);color:var(--blue)}
+.chip-green{background:rgba(30,138,94,.1);color:var(--green)}
+.chip-amber{background:rgba(201,130,10,.1);color:var(--amber)}
+.chip-red{background:rgba(192,57,43,.1);color:var(--red)}
+.chip-purple{background:rgba(103,58,183,.1);color:#673ab7}
+.run-pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;padding:4px 12px;border-radius:99px}
+.run-pill.running{background:rgba(30,138,94,.12);color:var(--green)}
+.run-pill.stopped{background:rgba(160,158,151,.12);color:var(--ink3)}
+.run-pill.error{background:rgba(192,57,43,.1);color:var(--red)}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:8px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;min-width:480px}
+th{padding:9px 12px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--ink3);background:var(--surface2);white-space:nowrap}
+td{padding:10px 12px;font-size:12px;border-top:1px solid var(--border);vertical-align:middle}
+tr:hover td{background:var(--bg)}
+.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700}
+.badge-ok{background:rgba(30,138,94,.1);color:var(--green)}
+.badge-na{background:rgba(160,158,151,.12);color:var(--ink3)}
+.badge-warn{background:rgba(201,130,10,.1);color:var(--amber)}
+.badge-info{background:rgba(41,98,168,.1);color:var(--blue)}
+.divider{height:1px;background:var(--border);margin:16px 0}
+.notice{border-radius:8px;padding:10px 13px;font-size:12px;font-weight:500;margin-bottom:12px;display:flex;gap:8px;align-items:flex-start}
+.notice i{margin-top:1px;flex-shrink:0}
+.notice-warn{background:rgba(201,130,10,.08);border:1px solid rgba(201,130,10,.2);color:#7a4f00}
+.notice-info{background:rgba(41,98,168,.07);border:1px solid rgba(41,98,168,.15);color:#183d6d}
+.tmpl-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px 14px;position:relative}
+.tmpl-name{font-family:'Syne',sans-serif;font-size:13px;font-weight:700;margin-bottom:3px}
+.tmpl-sub{font-size:12px;color:var(--blue);margin-bottom:4px}
+.tmpl-body{font-size:11px;color:var(--ink3);overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.tmpl-del{position:absolute;top:10px;right:10px;background:none;border:none;color:var(--ink3);cursor:pointer;font-size:13px;padding:4px}
+.tmpl-del:hover{color:var(--red)}
+.hist-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px 14px}
 .spin{animation:spin 1s linear infinite}
+.blink{animation:bl 1.3s ease infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.fade{animation:fd .25s ease}
-@keyframes fd{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-.blink{animation:bl 1.4s infinite}
-@keyframes bl{0%,100%{opacity:1}50%{opacity:.25}}
-::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:.3}}
+.fade-in{animation:fi .25s ease}
+@keyframes fi{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.hidden{display:none!important}
+.flex{display:flex}.items-center{align-items:center}.gap-2{gap:8px}.gap-3{gap:12px}
+.justify-between{justify-content:space-between}.flex-1{flex:1}.mt-2{margin-top:8px}.mt-3{margin-top:12px}
+.text-sm{font-size:12px}.text-xs{font-size:11px}.text-muted{color:var(--ink3)}
+.font-bold{font-weight:700}.text-accent{color:var(--accent)}
+.space-y > * + *{margin-top:10px}
+@media(max-width:480px){.card{padding:14px}.btn{padding:10px 16px;font-size:13px}.stat-val{font-size:22px}.nav-title{font-size:14px}.btn-row{flex-direction:column}}
 </style>
 </head>
 <body>
-
-<nav style="background:rgba(6,11,24,.96);border-bottom:1px solid rgba(99,102,241,0.1);backdrop-filter:blur(10px)" class="sticky top-0 z-40 px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-3">
-    <div class="btn-p w-9 h-9 rounded-xl flex items-center justify-center text-sm shadow-lg"><i class="fa-solid fa-bolt"></i></div>
-    <div>
-      <div class="font-bold text-white text-sm">LeadGen Pro <span class="text-indigo-400">Auto</span></div>
-      <div class="text-xs text-slate-500">Scrape, Store & Send Personalized Emails</div>
+<nav class="nav">
+  <div class="nav-inner">
+    <div class="nav-brand">
+      <div class="nav-logo"><i class="fa-solid fa-bolt"></i></div>
+      <div>
+        <div class="nav-title">Lead<span>Gen</span> Pro</div>
+        <div class="nav-sub">Scrape · Filter · Email</div>
+      </div>
+    </div>
+    <div id="run-status-pill" class="run-pill stopped">
+      <i class="fa-solid fa-circle" style="font-size:8px"></i>
+      <span id="run-status-text">Idle</span>
     </div>
   </div>
 </nav>
 
-<div class="max-w-5xl mx-auto px-4 py-6">
+<div class="container" style="padding-top:20px;padding-bottom:40px">
 
-  <!-- STATS -->
-  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-white" id="st">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-users text-indigo-400 text-xs"></i>Valid Leads</div></div>
-    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-emerald-400" id="se">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-envelope text-emerald-400 text-xs"></i>Emails Found</div></div>
-    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-sky-400" id="sp">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-phone text-sky-400 text-xs"></i>Phones</div></div>
-    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-violet-400" id="sw">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-globe text-violet-400 text-xs"></i>Websites</div></div>
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-val" id="st-leads">0</div>
+      <div class="stat-lbl"><span class="stat-dot" style="background:var(--accent)"></span>Valid Leads</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val" id="st-emails" style="color:var(--green)">0</div>
+      <div class="stat-lbl"><span class="stat-dot" style="background:var(--green)"></span>Emails Sent</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val" id="st-phones" style="color:var(--blue)">0</div>
+      <div class="stat-lbl"><span class="stat-dot" style="background:var(--blue)"></span>With Phone</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val" id="st-webs" style="color:var(--amber)">0</div>
+      <div class="stat-lbl"><span class="stat-dot" style="background:var(--amber)"></span>Websites</div>
+    </div>
   </div>
 
-  <!-- TABS -->
-  <div class="flex gap-2 mb-5 overflow-x-auto pb-1">
-    <button class="tab on" id="tab-search" onclick="showTab('search')"><i class="fa-solid fa-search mr-1.5"></i>Search & Run</button>
-    <button class="tab" id="tab-database" onclick="showTab('database')"><i class="fa-solid fa-database mr-1.5"></i>Connect Database</button>
-    <button class="tab" id="tab-connect" onclick="showTab('connect')"><i class="fa-solid fa-paper-plane mr-1.5"></i>Connect Email</button>
-    <button class="tab" id="tab-templates" onclick="showTab('templates')"><i class="fa-solid fa-envelope-open-text mr-1.5"></i>Templates</button>
-    <button class="tab" id="tab-history" onclick="showTab('history')"><i class="fa-solid fa-history mr-1.5"></i>History</button>
+  <div class="tab-bar">
+    <button class="tab-btn active" id="tab-search"    onclick="showTab('search')"><i class="fa-solid fa-magnifying-glass"></i> Search</button>
+    <button class="tab-btn"        id="tab-database"  onclick="showTab('database')"><i class="fa-solid fa-database"></i> Database</button>
+    <button class="tab-btn"        id="tab-connect"   onclick="showTab('connect')"><i class="fa-solid fa-paper-plane"></i> Email</button>
+    <button class="tab-btn"        id="tab-templates" onclick="showTab('templates')"><i class="fa-solid fa-file-lines"></i> Templates</button>
+    <button class="tab-btn"        id="tab-history"   onclick="showTab('history')"><i class="fa-solid fa-clock-rotate-left"></i> History</button>
   </div>
 
   <!-- SEARCH PANE -->
-  <div id="pane-search" class="fade">
-    <div class="card p-6 mb-4">
-      <h2 class="font-bold text-white text-sm mb-5 flex items-center gap-2">
-        <span class="btn-p w-7 h-7 rounded-lg flex items-center justify-center text-xs"><i class="fa-solid fa-crosshairs"></i></span>
-        Target Parameters
-      </h2>
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
-        <div><label class="text-xs text-slate-500 mb-1.5 block">📍 Location *</label><input id="m-loc" class="inp" placeholder="e.g. New York"></div>
-        <div><label class="text-xs text-slate-500 mb-1.5 block">🔍 Keyword *</label><input id="m-kw" class="inp" placeholder="e.g. dentist"></div>
-        <div><label class="text-xs text-slate-500 mb-1.5 block">🔢 Exact Target (Max 200)</label><input id="m-count" type="number" max="200" value="10" class="inp"></div>
-        <div><label class="text-xs text-slate-500 mb-1.5 block">⭐ Max Rating (Optional - For Bad Reviews)</label><input id="m-rating" type="number" step="0.1" class="inp" placeholder="e.g. 3.5"></div>
+  <div id="pane-search" class="fade-in">
+    <div class="card">
+      <div class="card-title"><i class="fa-solid fa-crosshairs"></i>Target Parameters</div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>📍 Location *</label>
+          <input id="m-loc" class="inp" placeholder="e.g. New York" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label>🔍 Keyword *</label>
+          <input id="m-kw" class="inp" placeholder="e.g. dentist" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label>🎯 Target Leads (max 200)</label>
+          <input id="m-count" type="number" min="1" max="200" value="10" class="inp">
+        </div>
+        <div class="form-group">
+          <label>⭐ Max Rating (optional)</label>
+          <input id="m-rating" type="number" step="0.1" min="1" max="5" class="inp" placeholder="e.g. 3.5">
+        </div>
       </div>
-      <div class="p-3 mb-4 rounded-xl text-xs" style="background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.2);color:#f87171">
-        <i class="fa-solid fa-shield-halved mr-1"></i> <b>Strict Mode:</b> Only leads with valid emails are counted. AI will auto-expand keywords until target is reached.
+      <div class="notice notice-warn mt-2">
+        <i class="fa-solid fa-triangle-exclamation"></i>
+        <span><b>Flow:</b> Scrapes your keyword first → filters by rating → 3-step website extraction → extracts emails → generates ONE keyword at a time if target not met.</span>
       </div>
-      <button onclick="startJob()" id="btn-run" class="btn-p w-full py-3 rounded-xl text-sm"><i class="fa-solid fa-play mr-2"></i>Start Scraping & Automation</button>
-    </div>
-
-    <!-- STATUS -->
-    <div id="sbox" class="hidden card p-5 mb-4 fade">
-      <div class="flex items-center gap-3 mb-3">
-        <i id="si" class="fa-solid fa-circle-notch spin text-indigo-400 text-xl"></i>
-        <span id="stxt" class="font-semibold text-white text-sm">Processing...</span>
-      </div>
-      <div class="prog mb-2"><div class="prog-fill" id="sbar" style="width:0%"></div></div>
-      <div id="sdet" class="text-xs text-slate-400 mb-3 font-mono bg-slate-900 p-2 rounded"></div>
-      <button id="dlbtn" onclick="doDL()" class="hidden btn-g w-full py-3 rounded-xl text-sm"><i class="fa-solid fa-download mr-2"></i>Download Leads CSV</button>
-    </div>
-
-    <!-- PREVIEW TABLE -->
-    <div id="pvbox" class="hidden card p-5 fade">
-      <div class="flex items-center justify-between mb-4">
-        <h3 class="font-bold text-white text-sm flex items-center gap-2">
-          <i class="fa-solid fa-table-cells text-indigo-400 text-xs"></i>
-          Preview <span id="pvcnt" class="text-slate-500 font-normal text-xs"></span>
-        </h3>
-        <button onclick="doDL()" class="btn-g px-4 py-2 rounded-lg text-xs">
-          <i class="fa-solid fa-download mr-1"></i>CSV
+      <div class="btn-row">
+        <button onclick="startJob()" id="btn-run" class="btn btn-primary">
+          <i class="fa-solid fa-play"></i>Start Scraping
+        </button>
+        <button onclick="stopJob()" id="btn-stop" class="btn btn-danger" disabled>
+          <i class="fa-solid fa-stop"></i>Stop
         </button>
       </div>
-      <div class="overflow-x-auto">
-        <table class="w-full text-xs border-collapse">
-          <thead><tr id="th" class="text-slate-500"></tr></thead>
-          <tbody id="tb"></tbody>
-        </table>
+    </div>
+
+    <div id="sbox" class="hidden card fade-in">
+      <div class="status-header">
+        <i id="si" class="fa-solid fa-circle-notch spin status-icon" style="color:var(--accent)"></i>
+        <span id="stxt" class="status-label">Processing...</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill" id="sbar" style="width:0%"></div></div>
+      <div id="sdet" class="status-detail">Initialising...</div>
+      <div class="debug-stats" id="debug-stats"></div>
+      <button id="dlbtn" onclick="doDL()" class="btn btn-success btn-full mt-3 hidden">
+        <i class="fa-solid fa-download"></i>Download Leads CSV
+      </button>
+    </div>
+
+    <div id="pvbox" class="hidden card fade-in">
+      <div class="flex items-center justify-between" style="margin-bottom:14px">
+        <div class="card-title" style="margin-bottom:0"><i class="fa-solid fa-table-cells"></i>Preview <span id="pvcnt" class="text-muted" style="font-weight:400;font-size:12px"></span></div>
+        <button onclick="doDL()" class="btn btn-neutral" style="font-size:12px;padding:7px 13px"><i class="fa-solid fa-download"></i> CSV</button>
+      </div>
+      <div class="table-wrap">
+        <table><thead><tr id="th"></tr></thead><tbody id="tb"></tbody></table>
       </div>
     </div>
   </div>
 
-  <!-- [NEW] DATABASE PANE -->
-  <div id="pane-database" class="hidden fade">
-    <div class="card p-6">
-      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-database text-blue-400 mr-2"></i>Connect Google Sheets Database</h2>
-      <p class="text-xs text-slate-400 mb-4 leading-relaxed">
-        Store all generated keywords, scraped businesses, emails, and logs automatically in Google Sheets.<br>
-        1. Go to <a href="https://script.google.com" target="_blank" class="text-blue-400 underline">script.google.com</a> and create a New Project.<br>
-        2. Copy and paste the script below.<br>
-        3. Click <b>Deploy > New Deployment</b>. Select type <b>Web app</b>.<br>
-        4. Set "Who has access" to <b>Anyone</b>. Click Deploy and copy the Web App URL.
-      </p>
-      
-      <div class="relative mb-5">
-        <button onclick="copyScript()" class="absolute top-2 right-2 bg-slate-800 hover:bg-slate-700 text-white text-xs py-1 px-3 rounded border border-slate-600 transition-colors z-10">Copy Script</button>
-        <textarea id="db-script-code" readonly class="inp font-mono text-xs h-48" style="color:#93c5fd">
+  <!-- DATABASE PANE -->
+  <div id="pane-database" class="hidden fade-in">
+    <div class="card">
+      <div class="card-title"><i class="fa-solid fa-database"></i>Connect Google Sheets Database</div>
+      <div class="notice notice-info">
+        <i class="fa-solid fa-circle-info"></i>
+        <span>Go to <a href="https://script.google.com" target="_blank" style="color:var(--blue)">script.google.com</a> → New Project → paste script → Deploy as Web App (Anyone) → copy URL.</span>
+      </div>
+      <div style="position:relative;margin-bottom:14px">
+        <!-- [PROBLEM 3] PIN lock button — settings are locked by default -->
+        <button onclick="unlockSettings()" class="btn btn-ghost btn-unlock" style="position:absolute;top:8px;right:60px;font-size:11px;padding:5px 10px;z-index:1"><i class="fa-solid fa-lock"></i> Unlock</button>
+        <button onclick="copyDBScript()" class="btn btn-neutral" style="position:absolute;top:8px;right:8px;font-size:11px;padding:5px 10px;z-index:1">Copy</button>
+        <textarea id="db-script-code" readonly class="inp" style="font-family:monospace;font-size:11px;height:160px;resize:none;padding-top:10px;color:var(--blue)">
 function doPost(e) {
-  var lock = LockService.getScriptLock();
-  lock.tryLock(10000);
+  var lock = LockService.getScriptLock(); lock.tryLock(10000);
   try {
-    var payload = JSON.parse(e.postData.contents);
-    var action = payload.action;
-    var data = payload.data;
+    var payload = JSON.parse(e.postData.contents), action = payload.action, data = payload.data;
     var ss = SpreadsheetApp.getActiveSpreadsheet();
-
     function getOrCreateSheet(name, headers) {
       var sheet = ss.getSheetByName(name);
-      if (!sheet) {
-        sheet = ss.insertSheet(name);
-        sheet.appendRow(headers);
-        sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
-      }
+      if (!sheet) { sheet = ss.insertSheet(name); sheet.appendRow(headers); sheet.getRange(1,1,1,headers.length).setFontWeight("bold"); }
       return sheet;
     }
-
     if (action === "init") {
-      getOrCreateSheet("Config", ["keyword_seed", "location", "target_leads", "min_rating", "max_rating", "email_required", "status"]);
-      getOrCreateSheet("Generated_Keywords", ["keyword", "source_seed", "status"]);
-      getOrCreateSheet("Scraped_Businesses", ["business_name", "address", "phone", "rating", "review_count", "website", "keyword", "status"]);
-      getOrCreateSheet("Email_Leads", ["business_name", "website", "email", "source_page", "status"]);
-      getOrCreateSheet("Qualified_Leads", ["business_name", "email", "website", "rating", "keyword", "personalization_line", "email_sent"]);
-      getOrCreateSheet("Logs", ["timestamp", "action", "details"]);
-      return ContentService.createTextOutput(JSON.stringify({status: "success"})).setMimeType(ContentService.MimeType.JSON);
-    }
-
-    if (action === "log") {
-      var sheet = ss.getSheetByName("Logs");
-      if(sheet) sheet.appendRow([data.timestamp, data.action, data.details]);
-    }
-    else if (action === "add_keyword") {
-      var sheet = ss.getSheetByName("Generated_Keywords");
-      if(sheet) sheet.appendRow([data.keyword, data.source_seed, data.status]);
-    }
-    else if (action === "add_scraped") {
-      var sheet = ss.getSheetByName("Scraped_Businesses");
-      if(sheet) sheet.appendRow([data.business_name, data.address, data.phone, data.rating, data.review_count, data.website, data.keyword, data.status]);
-    }
-    else if (action === "add_email_lead") {
-      var sheet = ss.getSheetByName("Email_Leads");
-      if(sheet) sheet.appendRow([data.business_name, data.website, data.email, data.source_page, data.status]);
-    }
-    else if (action === "add_qualified") {
-      var sheet = ss.getSheetByName("Qualified_Leads");
-      if(sheet) sheet.appendRow([data.business_name, data.email, data.website, data.rating, data.keyword, data.personalization_line, data.email_sent]);
-    }
-    else if (action === "update_config") {
-       var sheet = ss.getSheetByName("Config");
-       if(sheet) {
-         sheet.clearContents();
-         sheet.appendRow(["keyword_seed", "location", "target_leads", "min_rating", "max_rating", "email_required", "status"]);
-         sheet.appendRow([data.keyword_seed, data.location, data.target_leads, data.min_rating, data.max_rating, data.email_required, data.status]);
-       }
-    }
-    else if (action === "update_email_sent") {
-       var sheet = ss.getSheetByName("Qualified_Leads");
-       if(sheet) {
-         var dataRange = sheet.getDataRange();
-         var values = dataRange.getValues();
-         for (var i = 1; i < values.length; i++) {
-           if (values[i][1] === data.email) { 
-             sheet.getRange(i + 1, 6).setValue(data.personalization_line);
-             sheet.getRange(i + 1, 7).setValue("yes");
-             break;
-           }
-         }
-       }
-    }
-    return ContentService.createTextOutput(JSON.stringify({status: "success"})).setMimeType(ContentService.MimeType.JSON);
-  } catch(e) {
-    return ContentService.createTextOutput(JSON.stringify({status: "error", message: e.toString()})).setMimeType(ContentService.MimeType.JSON);
-  } finally {
-    lock.releaseLock();
-  }
+      getOrCreateSheet("Config",["keyword_seed","location","target_leads","min_rating","max_rating","email_required","status"]);
+      getOrCreateSheet("Generated_Keywords",["keyword","source_seed","status"]);
+      getOrCreateSheet("Scraped_Businesses",["business_name","address","phone","rating","review_count","website","maps_url","keyword","status"]);
+      getOrCreateSheet("Email_Leads",["business_name","website","email","source_page","status"]);
+      getOrCreateSheet("Qualified_Leads",["business_name","address","phone","rating","review_count","website","email","maps_url","keyword","personalization_line","email_sent"]);
+      getOrCreateSheet("Logs",["timestamp","action","details"]);
+    } else if (action === "log") { var s=ss.getSheetByName("Logs"); if(s) s.appendRow([data.timestamp,data.action,data.details]); }
+    else if (action === "add_keyword") { var s=ss.getSheetByName("Generated_Keywords"); if(s) s.appendRow([data.keyword,data.source_seed,data.status]); }
+    else if (action === "add_scraped") { var s=ss.getSheetByName("Scraped_Businesses"); if(s) s.appendRow([data.business_name,data.address,data.phone,data.rating,data.review_count,data.website,data.maps_url,data.keyword,data.status]); }
+    else if (action === "add_email_lead") { var s=ss.getSheetByName("Email_Leads"); if(s) s.appendRow([data.business_name,data.website,data.email,data.source_page,data.status]); }
+    else if (action === "add_qualified") { var s=ss.getSheetByName("Qualified_Leads"); if(s) s.appendRow([data.business_name,data.address,data.phone,data.rating,data.review_count,data.website,data.email,data.maps_url,data.keyword,data.personalization_line,data.email_sent]); }
+    else if (action === "update_config") { var s=ss.getSheetByName("Config"); if(s){s.clearContents();s.appendRow(["keyword_seed","location","target_leads","min_rating","max_rating","email_required","status"]);s.appendRow([data.keyword_seed,data.location,data.target_leads,data.min_rating,data.max_rating,data.email_required,data.status]);} }
+    else if (action === "update_email_sent") { var s=ss.getSheetByName("Qualified_Leads"); if(s){var v=s.getDataRange().getValues();for(var i=1;i<v.length;i++){if(v[i][6]===data.email){s.getRange(i+1,10).setValue(data.personalization_line);s.getRange(i+1,11).setValue("yes");break;}}} }
+    return ContentService.createTextOutput(JSON.stringify({status:"success"})).setMimeType(ContentService.MimeType.JSON);
+  } catch(e) { return ContentService.createTextOutput(JSON.stringify({status:"error",message:e.toString()})).setMimeType(ContentService.MimeType.JSON); }
+  finally { lock.releaseLock(); }
 }
-function doGet(e) {
-  return ContentService.createTextOutput(JSON.stringify({status: "active", message: "Database Connected"})).setMimeType(ContentService.MimeType.JSON);
-}</textarea>
+function doGet(e) { return ContentService.createTextOutput(JSON.stringify({status:"active"})).setMimeType(ContentService.MimeType.JSON); }</textarea>
       </div>
-      
-      <label class="text-xs text-slate-500 mb-1.5 block">🔗 Paste Database Web App URL Here:</label>
-      <input id="db-webhook-url" class="inp mb-4" placeholder="https://script.google.com/macros/s/AKfycb.../exec">
-      <button onclick="saveDBWebhook()" class="btn-b w-full py-2.5 rounded-xl text-sm"><i class="fa-solid fa-link mr-2"></i>Connect Database</button>
+      <div class="form-group" style="margin-bottom:12px">
+        <label>🔗 Database Web App URL</label>
+        <!-- [PROBLEM 3] Locked by default — requires PIN 0123 to edit -->
+        <input id="db-webhook-url" class="inp" placeholder="Locked — click Unlock to enter URL" disabled>
+      </div>
+      <button onclick="saveDBWebhook()" class="btn btn-primary btn-full"><i class="fa-solid fa-link"></i>Connect Database</button>
     </div>
   </div>
 
-  <!-- CONNECT EMAIL PANE -->
-  <div id="pane-connect" class="hidden fade">
-    <div class="card p-6">
-      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-paper-plane text-emerald-400 mr-2"></i>Google Apps Script Setup (Email Sender)</h2>
-      <p class="text-xs text-slate-400 mb-4 leading-relaxed">To send emails automatically from your Gmail, follow these steps:<br>1. Go to <a href="https://script.google.com" target="_blank" class="text-emerald-400 underline">script.google.com</a> and create a New Project.<br>2. Paste the code below.<br>3. Click <b>Deploy > New Deployment</b>. Select type <b>Web app</b>.<br>4. Set "Who has access" to <b>Anyone</b>. Click Deploy and copy the Web App URL.</p>
-      
-      <div class="relative mb-5">
-        <textarea readonly class="inp font-mono text-xs h-32" style="color:#a5b4fc">
+  <!-- EMAIL PANE -->
+  <div id="pane-connect" class="hidden fade-in">
+    <div class="card">
+      <div class="card-title"><i class="fa-solid fa-paper-plane"></i>Gmail Sender Setup</div>
+      <div class="notice notice-info">
+        <i class="fa-solid fa-circle-info"></i>
+        <span>Go to <a href="https://script.google.com" target="_blank" style="color:var(--blue)">script.google.com</a> → paste code → Deploy as Web App (Anyone) → copy URL.</span>
+      </div>
+      <div style="position:relative;margin-bottom:14px">
+        <!-- [PROBLEM 3] PIN lock button on Email settings too -->
+        <button onclick="unlockSettings()" class="btn btn-ghost btn-unlock" style="position:absolute;top:8px;right:8px;font-size:11px;padding:5px 10px;z-index:1"><i class="fa-solid fa-lock"></i> Unlock</button>
+        <textarea readonly class="inp" style="font-family:monospace;font-size:11px;height:110px;resize:none;color:var(--blue)">
 function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
-    MailApp.sendEmail({
-      to: data.to,
-      subject: data.subject,
-      htmlBody: data.body
-    });
-    return ContentService.createTextOutput(JSON.stringify({"status": "success"})).setMimeType(ContentService.MimeType.JSON);
+    MailApp.sendEmail({ to: data.to, subject: data.subject, htmlBody: data.body });
+    return ContentService.createTextOutput(JSON.stringify({"status":"success"})).setMimeType(ContentService.MimeType.JSON);
   } catch(err) {
-    return ContentService.createTextOutput(JSON.stringify({"status": "error", "message": err.toString()})).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({"status":"error","message":err.toString()})).setMimeType(ContentService.MimeType.JSON);
   }
 }</textarea>
       </div>
-      
-      <label class="text-xs text-slate-500 mb-1.5 block">🔗 Paste Email Web App URL Here:</label>
-      <input id="webhook-url" class="inp mb-4" placeholder="https://script.google.com/macros/s/AKfycb.../exec">
-      <button onclick="saveWebhook()" class="btn-g w-full py-2.5 rounded-xl text-sm"><i class="fa-solid fa-save mr-2"></i>Save Email Connection</button>
+      <div class="form-group" style="margin-bottom:12px">
+        <label>🔗 Email Web App URL</label>
+        <!-- [PROBLEM 3] Locked by default — requires PIN 0123 to edit -->
+        <input id="webhook-url" class="inp" placeholder="Locked — click Unlock to enter URL" disabled>
+      </div>
+      <button onclick="saveWebhook()" class="btn btn-success btn-full"><i class="fa-solid fa-save"></i>Save Email Webhook</button>
     </div>
   </div>
 
   <!-- TEMPLATES PANE -->
-  <div id="pane-templates" class="hidden fade">
-    <div class="card p-6 mb-4">
-      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-plus text-indigo-400 mr-2"></i>Add New Template</h2>
-      <input id="t-name" class="inp mb-3" placeholder="Template Name (e.g. SEO Pitch)">
-      <input id="t-sub" class="inp mb-3" placeholder="Subject (AI will personalize this)">
-      <textarea id="t-body" class="inp mb-3 h-24" placeholder="Email Body (HTML allowed. AI will personalize this based on lead info)"></textarea>
-      <button onclick="addTemplate()" class="btn-p w-full py-2.5 rounded-xl text-sm"><i class="fa-solid fa-plus mr-2"></i>Add Template</button>
+  <div id="pane-templates" class="hidden fade-in">
+    <div class="card">
+      <div class="card-title"><i class="fa-solid fa-plus"></i>Add Template</div>
+      <div class="form-group" style="margin-bottom:10px">
+        <label>Template Name</label>
+        <input id="t-name" class="inp" placeholder="e.g. SEO Pitch">
+      </div>
+      <div class="form-group" style="margin-bottom:10px">
+        <label>Subject</label>
+        <input id="t-sub" class="inp" placeholder="Subject line (AI personalizes this)">
+      </div>
+      <div class="form-group" style="margin-bottom:12px">
+        <label>Body (HTML allowed)</label>
+        <textarea id="t-body" class="inp" style="height:90px;resize:vertical" placeholder="Email body. Use {name}, {niche} as placeholders."></textarea>
+      </div>
+      <button onclick="addTemplate()" class="btn btn-primary btn-full"><i class="fa-solid fa-plus"></i>Add Template</button>
     </div>
-    <div class="card p-6">
-      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-list text-indigo-400 mr-2"></i>Saved Templates</h2>
-      <div id="t-list" class="space-y-3"></div>
+    <div class="card">
+      <div class="card-title"><i class="fa-solid fa-list"></i>Saved Templates</div>
+      <div id="t-list" class="space-y"></div>
     </div>
   </div>
 
   <!-- HISTORY PANE -->
-  <div id="pane-history" class="hidden fade">
-    <div class="card p-6">
-      <div class="flex justify-between items-center mb-4">
-        <h2 class="font-bold text-white text-sm"><i class="fa-solid fa-history text-indigo-400 mr-2"></i>Task History</h2>
-        <button onclick="clearHistory()" class="text-xs text-red-400"><i class="fa-solid fa-trash"></i> Clear</button>
+  <div id="pane-history" class="hidden fade-in">
+    <div class="card">
+      <div class="flex items-center justify-between" style="margin-bottom:14px">
+        <div class="card-title" style="margin-bottom:0"><i class="fa-solid fa-clock-rotate-left"></i>History</div>
+        <button onclick="clearHistory()" class="btn btn-ghost"><i class="fa-solid fa-trash"></i> Clear</button>
       </div>
-      <div id="h-list" class="space-y-3"></div>
+      <div id="h-list" class="space-y"></div>
     </div>
   </div>
 
 </div>
 
 <script>
-let jid=null, templates=[], historyData=[], tableShown=false;
+// ════════════════════════════════════════════════════
+// STATE + INIT
+// ════════════════════════════════════════════════════
+let jid = null, templates = [], historyData = [], tableShown = false;
+let pollTimer = null;
 
-window.onload=()=>{
-  document.getElementById('webhook-url').value = localStorage.getItem('webhook_url') || '';
-  document.getElementById('db-webhook-url').value = localStorage.getItem('db_webhook_url') || '';
-  templates = JSON.parse(localStorage.getItem('templates') || '[]');
-  historyData = JSON.parse(localStorage.getItem('history') || '[]');
-  renderTemplates();
-  renderHistory();
+// [PROBLEM 3] PIN lock system — all connection fields are locked by default.
+// PIN is 0123. Once unlocked all locked fields become editable in this session.
+function unlockSettings() {
+  let pin = prompt("Enter PIN to unlock settings:");
+  if (pin === "0123") {
+    document.getElementById('webhook-url').disabled    = false;
+    document.getElementById('db-webhook-url').disabled = false;
+    document.querySelectorAll('.btn-unlock').forEach(b => {
+      b.innerHTML = '<i class="fa-solid fa-lock-open"></i> Unlocked';
+      b.style.color = 'var(--green)';
+      b.disabled = true;
+    });
+  } else {
+    alert("Incorrect PIN. Settings remain locked.");
+  }
+}
+
+// [REFRESH FIX] Restore saved values and poll any active job on page load
+window.onload = async () => {
+  document.getElementById('webhook-url').value     = localStorage.getItem('webhook_url')    || '';
+  document.getElementById('db-webhook-url').value  = localStorage.getItem('db_webhook_url') || '';
+  templates   = JSON.parse(localStorage.getItem('templates') || '[]');
+  historyData = JSON.parse(localStorage.getItem('history')   || '[]');
+  renderTemplates(); renderHistory();
+
+  try {
+    const r = await fetch('/api/global_status');
+    const d = await r.json();
+    if (d.job_id && d.status && d.status !== 'not_found') {
+      jid = d.job_id;
+      if (d.leads && d.leads.length) { updStats(d.leads); showPV(d.leads); tableShown = true; }
+      if (d.status === 'scraping' || d.status === 'sending_emails') {
+        const pct = d.total_to_send > 0
+          ? (d.emails_sent / d.total_to_send) * 100
+          : Math.max(3, (d.count / 10) * 95);
+        setSt(d.status_text || 'Resuming…', d.status === 'sending_emails' ? 'email' : 'load', pct);
+        if (d.stats) renderDebugStats(d.stats);
+        document.getElementById('sbox').classList.remove('hidden');
+        setRunningUI(true);
+        startPolling(d.count || 10);
+      } else if (d.status === 'done' || d.status === 'stopped') {
+        setSt(d.status_text || 'Completed.', d.status === 'done' ? 'done' : 'stopped', 100);
+        if (d.stats) renderDebugStats(d.stats);
+        document.getElementById('sbox').classList.remove('hidden');
+        document.getElementById('dlbtn').classList.remove('hidden');
+        setRunningUI(false);
+      } else if (d.status === 'error') {
+        setSt(d.error || 'Error', 'err', 100);
+        document.getElementById('sbox').classList.remove('hidden');
+        setRunningUI(false);
+      }
+    }
+  } catch (e) { /* no active job or server not ready */ }
 };
 
-function showTab(t){
-  ['search','database','connect','templates','history'].forEach(x=>{
+const TABS = ['search','database','connect','templates','history'];
+function showTab(t) {
+  TABS.forEach(x => {
     document.getElementById('pane-'+x).classList.add('hidden');
-    document.getElementById('tab-'+x).classList.remove('on');
+    document.getElementById('tab-'+x).classList.remove('active');
   });
   document.getElementById('pane-'+t).classList.remove('hidden');
-  document.getElementById('tab-'+t).classList.add('on');
+  document.getElementById('tab-'+t).classList.add('active');
 }
 
-function copyScript() {
-  const code = document.getElementById('db-script-code');
-  code.select();
-  document.execCommand('copy');
-  alert("Database Script Copied!");
-}
+function saveWebhook()   { localStorage.setItem('webhook_url',    document.getElementById('webhook-url').value.trim());    alert('Email webhook saved!'); }
+function saveDBWebhook() { localStorage.setItem('db_webhook_url', document.getElementById('db-webhook-url').value.trim()); alert('Database webhook saved!'); }
+function copyDBScript()  { const el=document.getElementById('db-script-code'); el.select(); document.execCommand('copy'); alert('Script copied!'); }
 
-function saveWebhook(){
-  localStorage.setItem('webhook_url', document.getElementById('webhook-url').value.trim());
-  alert("Email Webhook Saved Successfully!");
-}
-
-function saveDBWebhook(){
-  localStorage.setItem('db_webhook_url', document.getElementById('db-webhook-url').value.trim());
-  alert("Database Webhook Saved Successfully!");
-}
-
-function addTemplate(){
-  const n = document.getElementById('t-name').value.trim();
-  const s = document.getElementById('t-sub').value.trim();
-  const b = document.getElementById('t-body').value.trim();
-  if(!n || !s || !b) return alert("Fill all fields!");
-  templates.push({name: n, subject: s, body: b});
-  localStorage.setItem('templates', JSON.stringify(templates));
-  document.getElementById('t-name').value=''; document.getElementById('t-sub').value=''; document.getElementById('t-body').value='';
+function addTemplate() {
+  const n=document.getElementById('t-name').value.trim();
+  const s=document.getElementById('t-sub').value.trim();
+  const b=document.getElementById('t-body').value.trim();
+  if(!n||!s||!b) return alert('Fill all template fields!');
+  templates.push({name:n,subject:s,body:b});
+  localStorage.setItem('templates',JSON.stringify(templates));
+  ['t-name','t-sub','t-body'].forEach(id=>document.getElementById(id).value='');
   renderTemplates();
 }
-
-function delTemplate(i){ templates.splice(i,1); localStorage.setItem('templates', JSON.stringify(templates)); renderTemplates(); }
-
-function renderTemplates(){
-  const el = document.getElementById('t-list');
-  if(!templates.length) return el.innerHTML = '<div class="text-xs text-slate-500 text-center">No templates added.</div>';
-  el.innerHTML = templates.map((t,i)=>`
-    <div class="p-4 rounded-xl bg-slate-800/50 border border-slate-700 relative">
-      <button onclick="delTemplate(${i})" class="absolute top-3 right-3 text-red-400 hover:text-red-300"><i class="fa-solid fa-trash"></i></button>
-      <div class="font-bold text-sm text-white mb-1">${t.name}</div>
-      <div class="text-xs text-indigo-300 mb-2">Sub: ${t.subject}</div>
-      <div class="text-xs text-slate-400 line-clamp-2">${t.body.replace(/</g,'&lt;')}</div>
+function delTemplate(i) { templates.splice(i,1); localStorage.setItem('templates',JSON.stringify(templates)); renderTemplates(); }
+function renderTemplates() {
+  const el=document.getElementById('t-list');
+  if(!templates.length) return el.innerHTML='<p class="text-xs text-muted" style="text-align:center;padding:8px">No templates added yet.</p>';
+  el.innerHTML=templates.map((t,i)=>`
+    <div class="tmpl-item">
+      <button class="tmpl-del" onclick="delTemplate(${i})"><i class="fa-solid fa-xmark"></i></button>
+      <div class="tmpl-name">${t.name}</div>
+      <div class="tmpl-sub">${t.subject}</div>
+      <div class="tmpl-body">${t.body.replace(/</g,'&lt;')}</div>
     </div>`).join('');
 }
 
-function renderHistory(){
-  const el = document.getElementById('h-list');
-  if(!historyData.length) return el.innerHTML = '<div class="text-xs text-slate-500 text-center">No history.</div>';
-  el.innerHTML = historyData.map(h=>`
-    <div class="p-3 rounded-xl bg-slate-800/50 border border-slate-700">
-      <div class="text-sm font-bold text-white">${h.loc} - ${h.kw}</div>
-      <div class="text-xs text-slate-400 mt-1">Target: ${h.target} | Date: ${h.date}</div>
+function renderHistory() {
+  const el=document.getElementById('h-list');
+  if(!historyData.length) return el.innerHTML='<p class="text-xs text-muted" style="text-align:center;padding:8px">No history yet.</p>';
+  el.innerHTML=historyData.map(h=>`
+    <div class="hist-item">
+      <div class="font-bold" style="font-size:13px">${h.kw} <span class="text-muted">in</span> ${h.loc}</div>
+      <div class="text-xs text-muted mt-2">Target: ${h.target} &nbsp;·&nbsp; ${h.date}</div>
     </div>`).join('');
 }
-function clearHistory(){ historyData=[]; localStorage.removeItem('history'); renderHistory(); }
+function clearHistory() { historyData=[]; localStorage.removeItem('history'); renderHistory(); }
 
-function setSt(msg, state='load', pct=null){
+function setRunningUI(running) {
+  const pill    = document.getElementById('run-status-pill');
+  const pillTxt = document.getElementById('run-status-text');
+  const btnRun  = document.getElementById('btn-run');
+  const btnStop = document.getElementById('btn-stop');
+  if (running) {
+    pill.className = 'run-pill running';
+    pillTxt.textContent = 'Running';
+    btnRun.disabled  = true;
+    btnStop.disabled = false;
+  } else {
+    pill.className = 'run-pill stopped';
+    pillTxt.textContent = 'Idle';
+    btnRun.disabled  = false;
+    btnStop.disabled = true;
+  }
+}
+
+function setSt(msg, state='load', pct=null) {
   document.getElementById('sbox').classList.remove('hidden');
   document.getElementById('sdet').textContent = msg;
-  const ic = document.getElementById('si');
-  const txt = document.getElementById('stxt');
-  
-  if(state==='load'){ ic.className='fa-solid fa-circle-notch spin text-indigo-400 text-xl'; txt.textContent='Scraping Engine Running...'; }
-  else if(state==='email'){ ic.className='fa-solid fa-paper-plane blink text-sky-400 text-xl'; txt.textContent='Automation: Sending Emails...'; }
-  else if(state==='done'){ ic.className='fa-solid fa-circle-check text-emerald-400 text-xl'; txt.textContent='Task Completed!'; }
-  else { ic.className='fa-solid fa-circle-xmark text-red-400 text-xl'; txt.textContent='Error Occurred!'; }
-  
-  if(pct!=null) document.getElementById('sbar').style.width=pct+'%';
+  const ic=document.getElementById('si'), txt=document.getElementById('stxt');
+  const iconMap = {
+    load:    ['fa-circle-notch spin', 'var(--accent)', 'Scraping Engine Running…'],
+    email:   ['fa-paper-plane blink', 'var(--green)',  'Sending Emails…'],
+    done:    ['fa-circle-check',      'var(--green)',  'Completed!'],
+    stopped: ['fa-stop-circle',       'var(--ink3)',   'Stopped by User'],
+    err:     ['fa-circle-xmark',      'var(--red)',    'Error Occurred'],
+  };
+  const [iconCls,col,label] = iconMap[state] || iconMap.load;
+  ic.className = `fa-solid ${iconCls} status-icon`;
+  ic.style.color = col;
+  txt.textContent = label;
+  if(pct!=null) document.getElementById('sbar').style.width = Math.min(100,pct)+'%';
 }
 
-function updStats(leads){
-  document.getElementById('st').textContent=leads.length;
-  document.getElementById('se').textContent=leads.length; 
-  document.getElementById('sp').textContent=leads.filter(l=>l.Phone&&l.Phone!='N/A').length;
-  document.getElementById('sw').textContent=leads.filter(l=>l.Website&&l.Website!='N/A').length;
+function renderDebugStats(stats) {
+  if(!stats) return;
+  document.getElementById('debug-stats').innerHTML = `
+    <span class="debug-chip chip-blue"  title="Total businesses scraped">Scraped: ${stats.scraped_total||0}</span>
+    <span class="debug-chip chip-amber" title="After rating filter">After filter: ${stats.after_rating_filter||0}</span>
+    <span class="debug-chip chip-green" title="Emails extracted">Emails: ${stats.emails_found||0}</span>
+    <span class="debug-chip chip-red"   title="Duplicates skipped">Dupes: ${stats.duplicates_skipped||0}</span>
+    <span class="debug-chip chip-purple"title="Keywords used">Keywords: ${stats.keywords_used||0}</span>
+    <span class="debug-chip chip-red"   title="Errors">Errors: ${stats.errors||0}</span>
+  `;
 }
 
-function showPV(leads){
-  if(!leads || !leads.length) return;
+function updStats(leads) {
+  document.getElementById('st-leads').textContent  = leads.length;
+  document.getElementById('st-emails').textContent = leads.filter(l=>l.Email&&l.Email!='N/A').length;
+  document.getElementById('st-phones').textContent = leads.filter(l=>l.Phone&&l.Phone!='N/A').length;
+  document.getElementById('st-webs').textContent   = leads.filter(l=>l.Website&&l.Website!='N/A').length;
+}
+
+function showPV(leads) {
+  if(!leads?.length) return;
   document.getElementById('pvbox').classList.remove('hidden');
-  document.getElementById('pvcnt').textContent='('+leads.length+' total, top 10)';
-  const keys=Object.keys(leads[0]);
-  document.getElementById('th').innerHTML=keys.map(k=>`<th class="px-3 py-2 text-left text-slate-500 font-medium whitespace-nowrap" style="border-bottom:1px solid rgba(255,255,255,0.05)">${k}</th>`).join('');
-  document.getElementById('tb').innerHTML=leads.slice(0,10).map(l=>
-    `<tr style="border-bottom:1px solid rgba(255,255,255,0.04)">${keys.map(k=>{
+  document.getElementById('pvcnt').textContent = `(${leads.length} total · showing top 10)`;
+  const keys = Object.keys(leads[0]).filter(k=>k!=='Maps_Link');
+  document.getElementById('th').innerHTML = keys.map(k=>`<th>${k}</th>`).join('');
+  document.getElementById('tb').innerHTML = leads.slice(0,10).map(l=>
+    `<tr>${keys.map(k=>{
       const v=(l[k]||'N/A').toString();
-      const cls=v==='N/A'?'pr':k==='Email'?'pg':k==='Phone'?'pb':'';
-      return `<td class="px-3 py-2.5 text-slate-300 max-w-xs whitespace-nowrap overflow-hidden text-ellipsis">${cls?`<span class="pill ${cls}">${v}</span>`:v}</td>`;
+      const cls = v==='N/A'?'badge-na':k==='Email'?'badge-ok':k==='Rating'?'badge-warn':k==='Phone'?'badge-info':'';
+      const disp = v.length>40 ? v.substring(0,40)+'…' : v;
+      return `<td>${cls?`<span class="badge ${cls}">${disp}</span>`:disp}</td>`;
     }).join('')}</tr>`
   ).join('');
 }
 
-async function startJob(){
-  const loc=document.getElementById('m-loc').value.trim();
-  const kw=document.getElementById('m-kw').value.trim();
-  let count=parseInt(document.getElementById('m-count').value)||10;
-  if(count > 200) count = 200;
-  
-  if(!loc||!kw) return alert('Location & Keyword required!');
-  
-  const webhook = document.getElementById('webhook-url').value.trim();
-  const db_webhook = document.getElementById('db-webhook-url').value.trim();
-  
-  if(!db_webhook) alert("Notice: Database Webhook is missing. Data will not be saved to Google Sheets.");
-  if(!webhook && templates.length > 0) alert("Warning: Email Webhook URL is missing. Emails will NOT be sent.");
-  if(webhook && templates.length === 0) alert("Warning: No templates added. Emails will NOT be sent.");
+async function startJob() {
+  const loc   = document.getElementById('m-loc').value.trim();
+  const kw    = document.getElementById('m-kw').value.trim();
+  let   count = Math.min(parseInt(document.getElementById('m-count').value)||10, 200);
+  if(!loc||!kw) return alert('Location and Keyword are required!');
+  const webhook    = localStorage.getItem('webhook_url')    || '';
+  const db_webhook = localStorage.getItem('db_webhook_url') || '';
 
-  setSt('Initializing AI Search Engine...','load',5);
+  setSt(`Starting scrape for: ${kw} in ${loc}...`, 'load', 2);
   document.getElementById('dlbtn').classList.add('hidden');
   document.getElementById('pvbox').classList.add('hidden');
-  document.getElementById('btn-run').disabled=true;
+  document.getElementById('debug-stats').innerHTML = '';
   tableShown = false;
+
+  setRunningUI(true);
 
   const payload = {
     location: loc, keyword: kw, max_leads: count,
-    max_rating: document.getElementById('m-rating').value || null,
-    webhook_url: webhook, db_webhook_url: db_webhook, templates: templates
+    max_rating:      document.getElementById('m-rating').value.trim() || null,
+    webhook_url:     webhook,
+    db_webhook_url:  db_webhook,
+    templates:       templates,
   };
 
   try {
-      const r = await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-      const d = await r.json();
-      if(d.error){ setSt(d.error,'err'); document.getElementById('btn-run').disabled=false; return; }
-      jid = d.job_id;
-
-      historyData.unshift({loc: loc, kw: kw, target: count, date: new Date().toLocaleString()});
-      localStorage.setItem('history', JSON.stringify(historyData)); renderHistory();
-
-      const poll = async()=>{
-        try {
-            const r2 = await fetch('/api/status/'+jid); 
-            const d2 = await r2.json();
-            
-            if(d2.status==='scraping'){
-                setSt(d2.status_text, 'load', Math.max(5, (d2.count/count)*100));
-                if(d2.leads && d2.leads.length > 0) {
-                    updStats(d2.leads);
-                    if(!tableShown) { showPV(d2.leads); tableShown=true; }
-                }
-                setTimeout(poll, 3000);
-            }
-            else if(d2.status==='sending_emails'){
-                if(!tableShown && d2.leads) {
-                    updStats(d2.leads); showPV(d2.leads); tableShown = true;
-                }
-                document.getElementById('dlbtn').classList.remove('hidden');
-                let emailPct = d2.total_to_send > 0 ? (d2.emails_sent / d2.total_to_send) * 100 : 100;
-                setSt(d2.status_text, 'email', Math.max(5, emailPct));
-                setTimeout(poll, 3000);
-            }
-            else if(d2.status==='done'){
-              document.getElementById('btn-run').disabled=false;
-              if(d2.leads) { updStats(d2.leads); showPV(d2.leads); }
-              setSt(d2.status_text, 'done', 100);
-              document.getElementById('dlbtn').classList.remove('hidden');
-            } 
-            else if(d2.status==='error'){
-              document.getElementById('btn-run').disabled=false;
-              setSt(d2.error, 'err');
-            }
-            else {
-              setTimeout(poll, 3000);
-            }
-        } catch(e) {
-            setTimeout(poll, 3000);
-        }
-      };
-      setTimeout(poll, 2000);
+    const r = await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d = await r.json();
+    if(d.error){ setSt(d.error,'err'); setRunningUI(false); return; }
+    jid = d.job_id;
+    historyData.unshift({loc,kw,target:count,date:new Date().toLocaleString()});
+    localStorage.setItem('history',JSON.stringify(historyData)); renderHistory();
+    startPolling(count);
   } catch(e) {
-      setSt('Failed to connect to server.','err');
-      document.getElementById('btn-run').disabled=false;
+    setSt('Could not connect to server.','err');
+    setRunningUI(false);
   }
 }
 
-function doDL(){ if(jid) window.location='/api/download/'+jid; }
+async function stopJob() {
+  if (!jid) return;
+  try {
+    document.getElementById('btn-stop').disabled = true;
+    document.getElementById('btn-stop').innerHTML = '<i class="fa-solid fa-spinner spin"></i> Stopping…';
+    await fetch('/api/stop/' + jid, { method: 'POST' });
+    setSt('Stop signal sent — waiting for current operation to finish…', 'load', null);
+  } catch(e) { console.error('Stop failed:', e); }
+}
+
+function startPolling(target) {
+  if (pollTimer) clearTimeout(pollTimer);
+
+  const poll = async () => {
+    try {
+      const r2 = await fetch('/api/status/'+jid);
+      const d2 = await r2.json();
+      if(d2.stats) renderDebugStats(d2.stats);
+
+      if(d2.status==='scraping') {
+        const pct = Math.max(3, (d2.count / target) * 95);
+        setSt(d2.status_text||'Scraping…', 'load', pct);
+        if(d2.leads?.length){ updStats(d2.leads); if(!tableShown){showPV(d2.leads);tableShown=true;} }
+        pollTimer = setTimeout(poll, 2500);
+
+      } else if(d2.status==='sending_emails') {
+        if(!tableShown&&d2.leads){ updStats(d2.leads); showPV(d2.leads); tableShown=true; }
+        document.getElementById('dlbtn').classList.remove('hidden');
+        const pct = d2.total_to_send>0 ? (d2.emails_sent/d2.total_to_send)*100 : 50;
+        setSt(d2.status_text||'Sending…','email',pct);
+        pollTimer = setTimeout(poll, 2500);
+
+      } else if(d2.status==='done') {
+        setRunningUI(false);
+        if(d2.leads){ updStats(d2.leads); showPV(d2.leads); }
+        setSt(d2.status_text||'Done!','done',100);
+        document.getElementById('dlbtn').classList.remove('hidden');
+
+      } else if(d2.status==='stopped') {
+        setRunningUI(false);
+        if(d2.leads){ updStats(d2.leads); showPV(d2.leads); }
+        setSt(d2.status_text||'Stopped by user.','stopped',100);
+        if(d2.leads && d2.leads.length) document.getElementById('dlbtn').classList.remove('hidden');
+        document.getElementById('btn-stop').innerHTML = '<i class="fa-solid fa-stop"></i> Stop';
+
+      } else if(d2.status==='error') {
+        setRunningUI(false);
+        setSt(d2.error||'Unknown error','err');
+
+      } else {
+        pollTimer = setTimeout(poll, 2500);
+      }
+    } catch(e) {
+      pollTimer = setTimeout(poll, 2500);
+    }
+  };
+  pollTimer = setTimeout(poll, 1500);
+}
+
+function doDL() { if(jid) window.location='/api/download/'+jid; }
 </script>
 </body>
 </html>"""
+
 
 @flask_app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+
 @flask_app.route('/api/scrape', methods=['POST'])
 def start_api_job():
+    global latest_job_id
     data = request.json
     job_id = str(uuid.uuid4())[:8]
+    logger.info(
+        f"[API] New job {job_id}: "
+        f"keyword='{data.get('keyword')}' "
+        f"location='{data.get('location')}' "
+        f"target={data.get('max_leads')} "
+        f"max_rating={data.get('max_rating')}"
+    )
+
+    # Create stop event before thread starts (threading.Event starts unset = run normally)
+    job_stop_flags[job_id] = threading.Event()
+    latest_job_id = job_id
+
     t = threading.Thread(target=run_job_thread, args=(job_id, data))
     t.daemon = True
     t.start()
     return jsonify({'job_id': job_id})
 
+
+@flask_app.route('/api/stop/<job_id>', methods=['POST'])
+def stop_job(job_id):
+    flag = job_stop_flags.get(job_id)
+    if flag:
+        flag.set()
+        logger.info(f"[API] 🛑 Stop requested for job {job_id}")
+        return jsonify({'status': 'stop_requested', 'job_id': job_id})
+    return jsonify({'status': 'not_found', 'job_id': job_id}), 404
+
+
 @flask_app.route('/api/status/<job_id>')
 def status(job_id):
     job = jobs.get(job_id, {'status': 'not_found'})
     out = dict(job)
-    if out.get('status') in ['sending_emails', 'done', 'scraping']:
+    if out.get('status') in ['sending_emails', 'done', 'scraping', 'stopped', 'starting']:
         out['leads'] = job.get('leads', [])
     return jsonify(out)
+
+
+@flask_app.route('/api/global_status')
+def global_status():
+    global latest_job_id
+    if not latest_job_id or latest_job_id not in jobs:
+        return jsonify({'status': 'not_found', 'job_id': None})
+
+    job = jobs[latest_job_id]
+    out = dict(job)
+    out['job_id'] = latest_job_id
+    out['leads']  = job.get('leads', [])
+    return jsonify(out)
+
 
 @flask_app.route('/api/download/<job_id>')
 def download(job_id):
     job = jobs.get(job_id)
-    if not job or job.get('status') not in ['done', 'sending_emails']: return "Not ready", 400
+    if not job or job.get('status') not in ['done', 'sending_emails', 'stopped']:
+        return "Not ready", 400
     leads = job.get('leads', [])
-    if not leads: return "No leads found", 404
-    
+    if not leads:
+        return "No leads found", 404
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=leads[0].keys())
     writer.writeheader()
     writer.writerows(leads)
     out.seek(0)
-    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='Target_Leads.csv')
+    return send_file(
+        io.BytesIO(out.getvalue().encode('utf-8-sig')),
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name='Target_Leads.csv',
+    )
 
-# ══════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════
 #   TELEGRAM BOT
-# ══════════════════════════════════════════════
+#   [PROBLEM 2] Same strict one-by-one keyword flow as the web job runner.
+# ════════════════════════════════════════════════════
 def to_csv(leads):
-    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8-sig', newline='')
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False,
+                                      encoding='utf-8-sig', newline='')
     if leads:
         writer = csv.DictWriter(tmp, fieldnames=leads[0].keys())
         writer.writeheader()
@@ -912,7 +2168,16 @@ bot_store = {}
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🚀 Start Search", callback_data="start_manual")]]
-    await update.message.reply_text("👋 *LeadGen Pro Bot*\n\n✅ Strict Valid Emails Only\n✅ Auto AI Keyword Expansion\n✅ Max Limit: 200\n\n_Note: For Email Automation, please use the Web Dashboard._", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(
+        "👋 *LeadGen Pro Bot*\n\n"
+        "✅ Scrapes main keyword FIRST\n"
+        "✅ One keyword at a time — fully processed before next\n"
+        "✅ Worst-rated businesses first\n"
+        "✅ 3-step website extraction\n"
+        "✅ Deduplication active\n"
+        "✅ Max: 200 leads",
+        parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb)
+    )
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -928,7 +2193,7 @@ async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def m_kw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['kw'] = update.message.text
-    await update.message.reply_text("🔢 Enter Target Number of Valid Emails (Max 200):")
+    await update.message.reply_text("🔢 Target Valid Emails (Max 200):")
     return M_COUNT
 
 async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -936,107 +2201,146 @@ async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if count > 200: count = 200
     uid = update.message.from_user.id
     bot_store[uid]['count'] = count
-    await update.message.reply_text("⭐ Max Rating Filter? (Type 'skip' to ignore, e.g. 3.5):")
+    await update.message.reply_text("⭐ Max Rating Filter? (e.g. 3.5 | type 'skip'):")
     return M_RATING
 
 async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.lower()
     uid = update.message.from_user.id
     bot_store[uid]['rating'] = None if txt == 'skip' else txt
-    
     data = bot_store[uid]
-    txt_summary = f"📋 *Target Guarantee*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Target: {data['count']} Valid Emails\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nStart Scraping?"
+    summary = (
+        f"📋 *Config*\n📍 {data['loc']}\n🔍 {data['kw']}\n"
+        f"🔢 {data['count']} leads\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nStart?"
+    )
     kb = [[InlineKeyboardButton("✅ Start", callback_data="start_scrape")]]
-    await update.message.reply_text(txt_summary, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(summary, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-def run_bot_scrape_fast(data):
-    location = data['loc']
+def run_bot_scrape_fast(data: dict) -> list:
+    location     = data['loc']
     base_keyword = data['kw']
-    max_leads = data['count']
-    max_rating = data.get('rating')
-    
-    maps_scraper = GoogleMapsScraper()
-    email_lib = DeepEmailExtractor()
-    
-    seen_names = set()
-    used_keywords = set()
+    max_leads    = data['count']
+    max_rating   = data.get('rating')
+
+    max_rating_float = None
+    if max_rating:
+        try:
+            max_rating_float = float(str(max_rating).replace(',', '.'))
+        except:
+            pass
+
+    m_scraper  = GoogleMapsScraper()
+    e_lib      = DeepEmailExtractor()
+    kw_engine  = AdvancedKeywordEngine()
+    dedup      = DeduplicationStore()
+
+    used_keywords    = set()
+    # [PROBLEM 2] Start with ONLY the base keyword — generate one at a time after
     pending_keywords = [base_keyword]
-    final_leads = []
-    
+    final_leads      = []
+
     while len(final_leads) < max_leads:
         if not pending_keywords:
-            new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
-            pending_keywords.extend(new_kws)
-            
+            # [PROBLEM 2] Generate EXACTLY ONE new keyword when queue is empty
+            new_kw = kw_engine.generate_single_keyword(base_keyword, location, used_keywords)
+            if new_kw:
+                pending_keywords.append(new_kw)
+            else:
+                break
+
         current_kw = pending_keywords.pop(0)
         used_keywords.add(current_kw.lower())
-        
-        raw_leads = maps_scraper.fetch_batch(current_kw, location)
-        
+        raw_leads = m_scraper.fetch_batch(current_kw, location)
+
         for lead in raw_leads:
-            if len(final_leads) >= max_leads: break
-            if lead['Name'] in seen_names: continue
-            
-            if max_rating and lead['Rating'] != "N/A":
+            if len(final_leads) >= max_leads:
+                break
+
+            if max_rating_float is not None and lead['Rating'] != "N/A":
                 try:
-                    if float(lead['Rating']) > float(max_rating): continue
-                except: pass
-                
-            if lead['Website'] == "N/A": continue
-                
-            extracted_email = email_lib.get_email(lead['Website'])
-            if extracted_email == "N/A": continue
-            
+                    if float(lead['Rating']) > max_rating_float:
+                        continue
+                except:
+                    pass
+
+            # [PROBLEM 1] Three-step website extraction for Telegram bot too
+            website = lead['Website']
+            if not m_scraper.is_valid_website(website):
+                website = "N/A"
+
+            if website == "N/A" and lead.get('Maps_Link') != "N/A":
+                website = m_scraper.fetch_website_from_details(lead['Maps_Link'])
+
+            if website == "N/A":
+                website = m_scraper.find_website_via_search(lead['Name'], location)
+
+            lead['Website'] = website
+            if website == "N/A":
+                continue
+
+            # [PROBLEM 5] Deduplication for Telegram bot
+            if dedup.is_duplicate(lead['Name'], location, website, ""):
+                continue
+
+            extracted_email = e_lib.get_email(website)
+            if extracted_email == "N/A":
+                continue
+
+            if dedup.is_duplicate(lead['Name'], location, website, extracted_email):
+                continue
+            dedup.register(lead['Name'], location, website, extracted_email)
+
             lead['Email'] = extracted_email
-            seen_names.add(lead['Name'])
             final_leads.append(lead)
-            
+
     return final_leads
 
 async def background_bot_task(chat_id, message_id, data, bot):
     try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="⏳ *Fast Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
-        
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id,
+            text="⏳ *Scraping now...*\n_One keyword at a time · 3-step website extraction · Worst-rated first_",
+            parse_mode='Markdown'
+        )
         loop = asyncio.get_event_loop()
         final_leads = await loop.run_in_executor(None, run_bot_scrape_fast, data)
-        
         if not final_leads:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="😔 No results found.")
             return
-
         path = to_csv(final_leads)
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="✅ Done! Sending file...")
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="✅ Done! Sending CSV...")
         with open(path, 'rb') as f:
             await bot.send_document(
-                chat_id=chat_id, document=f, filename=f"Target_Leads.csv",
-                caption=f"🎯 *Target Reached!*\n📊 Total Valid Emails: {len(final_leads)}", parse_mode='Markdown'
+                chat_id=chat_id, document=f, filename="Target_Leads.csv",
+                caption=f"🎯 *Done!*\n📊 Valid Leads: {len(final_leads)}", parse_mode='Markdown'
             )
         os.unlink(path)
     except Exception as e:
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=f"❌ Error: `{e}`", parse_mode='Markdown')
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id,
+            text=f"❌ Error: `{e}`", parse_mode='Markdown'
+        )
 
 async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
     data = bot_store.get(uid)
-    
-    msg = await q.edit_message_text("⏳ *Initializing background task...*", parse_mode='Markdown')
+    msg = await q.edit_message_text("⏳ *Initialising...*", parse_mode='Markdown')
     asyncio.create_task(background_bot_task(q.message.chat_id, msg.message_id, data, ctx.bot))
 
 def run_telegram_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_mode, pattern="^start_manual$")],
         states={
-            M_LOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_loc)],
-            M_KW: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_kw)],
-            M_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_count)],
-            M_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)]
+            M_LOC:    [MessageHandler(filters.TEXT & ~filters.COMMAND, m_loc)],
+            M_KW:     [MessageHandler(filters.TEXT & ~filters.COMMAND, m_kw)],
+            M_COUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, m_count)],
+            M_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)],
         },
         fallbacks=[],
         per_message=False,
@@ -1044,12 +2348,16 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(execute_scrape, pattern="^start_scrape$"))
-    
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
+
+# ════════════════════════════════════════════════════
+#   ENTRY POINT
+# ════════════════════════════════════════════════════
 if __name__ == "__main__":
     if TELEGRAM_TOKEN:
         threading.Thread(target=run_telegram_bot, daemon=True).start()
+        logger.info("[BOOT] Telegram bot started")
     port = int(os.environ.get("PORT", 10000))
+    logger.info(f"[BOOT] Flask starting on port {port}")
     flask_app.run(host='0.0.0.0', port=port)
-
